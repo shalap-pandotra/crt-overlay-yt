@@ -42,5 +42,3 @@ position/size every frame, and drawing the shaded result on top of it
 while the original video is hidden (not removed, so audio/decoding
 still work normally). A separate MutationObserver-based watcher handles
 YouTube's SPA navigation between videos.
-
-## License MIT: See [License](LICENSE) for details
