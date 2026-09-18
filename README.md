@@ -43,4 +43,32 @@ while the original video is hidden (not removed, so audio/decoding
 still work normally). A separate MutationObserver-based watcher handles
 YouTube's SPA navigation between videos.
 
-## License MIT: See [License](LICENSE) for details
+## Performance notes (not yet acted on)
+
+Profiling (step 7) showed steady 60fps in real use with acceptable CPU
+overhead, so none of this was urgent enough to act on. Left here for
+if it ever does matter (weaker hardware, wanting lower battery/CPU
+draw, etc).
+
+- **Full render pipeline runs every frame even when the video is
+  paused, as long as the tab is visible.** Background-tab idling is
+  already handled (skips work via `document.hidden`), but a paused
+  video in the ACTIVE tab still redraws the identical frame 60x/sec —
+  full texture upload, scene shader, bright-pass, 2 blur passes,
+  composite. Deliberately not "fixed" the same way background tabs
+  were, because tying render skipping to `video.paused` instead of tab
+  visibility is exactly what caused the seek/resume jitter bug earlier
+  in this project — so any fix here needs to be more careful than a
+  naive "skip when paused" (e.g. only skip after N consecutive
+  identical frames, or skip but keep a low-rate heartbeat render).
+- **`texImage2D` uploads the full video frame every frame**, regardless
+  of whether playback actually advanced. This is one of the more
+  expensive individual calls in the pipeline.
+- **Bright-pass samples a 3x3 neighborhood** (9 texture reads per
+  output pixel) instead of 1 — necessary for correctness (fixes the
+  cinema-mode bloom-disappearing bug), but real added cost. Not worth
+  reverting, just worth knowing where the extra cost comes from.
+- **`syncPlayerToVideo()` calls `getBoundingClientRect()` twice every
+  frame** (video + its parent), regardless of whether anything actually
+  moved or resized. Could cache and only re-check on a lower-rate timer
+  or via ResizeObserver/IntersectionObserver instead of every frame.
