@@ -21,10 +21,10 @@
   // ============================================================
   const DEFAULT_PARAMS = {
     enabled: true,
-    scan: 0.19, scanCount: 360, bloom: 0.67, warp: 0.025,
-    vig: 0.24, bleed: 0.37, bloomThresh: 0.27, ambientGlow: 0.08,
-    tintColor: '#bfffd1', // hex, matches the original vec3(0.75, 1.0, 0.82)
-    tintStrength: 0.35,   // matches the original hardcoded mix amount
+    scan: 0.47, scanCount: 390, bloom: 0.75, warp: 0.055,
+    vig: 0.29, bleed: 0.29, bloomThresh: 0.67, ambientGlow: 0.5,
+    tintColor: '#8080c0',
+    tintStrength: 0.13,
   };
 
   const STORAGE_KEY = 'crt-shader-settings';
@@ -249,7 +249,22 @@ void main() {
   vec2 q = abs(pixelPos - halfSize) - halfSize + cornerRadiusPx;
   float roundedDist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - cornerRadiusPx;
 
-  if (roundedDist > 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+  // Anti-aliased edges: fade alpha smoothly over ~1.5px around each
+  // boundary instead of a hard discard. A binary cutoff can't produce a
+  // smooth edge on a curve by definition — every pixel is either fully
+  // in or fully out, which is exactly what staircases on the rounded
+  // corners. This alpha has to survive all the way through the bloom
+  // pipeline to the final composite (see compositeFragSrc below), or
+  // it'll get silently discarded there instead.
+  float aaPx = 1.5;
+  float roundedAlpha = 1.0 - smoothstep(-aaPx, aaPx, roundedDist);
+
+  vec2 edgeDistUv = min(uv, 1.0 - uv); // distance to nearest uv-space edge (negative if outside)
+  float edgeDistPx = min(edgeDistUv.x * uResolution.x, edgeDistUv.y * uResolution.y);
+  float warpAlpha = smoothstep(0.0, aaPx, edgeDistPx);
+
+  float edgeAlpha = roundedAlpha * warpAlpha;
+  if (edgeAlpha <= 0.001) {
     gl_FragColor = vec4(0.0);
     return;
   }
@@ -275,7 +290,7 @@ void main() {
   col *= scanMul;
   col *= vig;
 
-  gl_FragColor = vec4(col, 1.0);
+  gl_FragColor = vec4(col, edgeAlpha);
 }`;
 
     function compile(context, type, src) {
@@ -480,9 +495,14 @@ uniform sampler2D uScene;
 uniform sampler2D uBloom;
 uniform float uBloomStrength;
 void main() {
-  vec3 scene = texture2D(uScene, vUv).rgb;
+  // Alpha comes from the SCENE texture (which carries the anti-aliased
+  // rounded-corner/barrel-edge mask from the main shader), not
+  // hardcoded to 1.0 — otherwise that soft edge alpha gets silently
+  // discarded here and the final on-screen result is opaque everywhere
+  // regardless of what the scene pass actually computed.
+  vec4 sceneSample = texture2D(uScene, vUv);
   vec3 bloom = texture2D(uBloom, vUv).rgb;
-  gl_FragColor = vec4(scene + bloom * uBloomStrength, 1.0);
+  gl_FragColor = vec4(sceneSample.rgb + bloom * uBloomStrength, sceneSample.a);
 }`;
 
     const brightProg = makeProgram(brightFragSrc);
@@ -600,12 +620,82 @@ void main() {
     panel.id = 'crt-panel';
     Object.assign(panel.style, {
       position: 'fixed', top: '10px', right: '10px', zIndex: '2147483002',
-      background: 'rgba(10,10,15,.9)', color: '#9f9',
-      fontFamily: 'monospace', fontSize: '12px', padding: '12px 14px',
-      borderRadius: '6px', width: '250px', lineHeight: '1.6',
-      border: '1px solid rgba(150,255,150,.25)', display: 'none',
+      background: '#fafafa', color: '#1d1d1d',
+      fontFamily: 'Georgia, "Times New Roman", Times, serif', fontSize: '13px', padding: '14px 16px',
+      borderRadius: '8px', width: '250px', lineHeight: '1.6',
+      border: '1.5px solid #e2e2e2', display: 'none',
       maxHeight: '90vh', overflowY: 'auto',
+      boxShadow: '0 4px 14px #bebebe',
+      paddingRight: '32px',
     });
+
+    // Cross-browser two-tone slider track (filled portion vs remaining
+    // track) can't be done with a single native CSS property — it needs
+    // -webkit/-moz-specific pseudo-elements for the thumb, and the fill
+    // itself is done by computing a plain CSS gradient and applying it
+    // as the input's own background (updated on every change), rather
+    // than relying on ::-webkit-slider-runnable-track / -moz-range-progress,
+    // which differ enough between browsers that hand-computing the
+    // gradient ourselves is more predictable.
+    const sliderStyleTag = document.createElement('style');
+    sliderStyleTag.textContent = `
+#crt-panel input[type=range] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: 1.5px;
+  outline: none;
+  background: #8d8d8d;
+}
+#crt-panel input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: #fe0705;
+  cursor: pointer;
+  margin-top: -5px;
+}
+#crt-panel input[type=range]::-moz-range-thumb {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: #fe0705;
+  border: none;
+  cursor: pointer;
+}
+#crt-panel input[type=range]::-moz-range-track {
+  height: 3px;
+  border-radius: 1.5px;
+  background: transparent;
+}
+#crt-panel input[type=text]:focus,
+#crt-panel input[type=color]:focus {
+  outline: none;
+}
+#crt-panel {
+  scrollbar-width: thin;
+  scrollbar-color: #d0d0d0 transparent;
+}
+#crt-panel::-webkit-scrollbar {
+  width: 6px;
+}
+#crt-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+#crt-panel::-webkit-scrollbar-thumb {
+  background: #d0d0d0;
+  border-radius: 3px;
+}
+#crt-panel::-webkit-scrollbar-thumb:hover {
+  background: #bebebe;
+}
+`;
+    document.head.appendChild(sliderStyleTag);
+
+    function updateSliderFill(input) {
+      const min = parseFloat(input.min), max = parseFloat(input.max), val = parseFloat(input.value);
+      const pct = ((val - min) / (max - min)) * 100;
+      input.style.background = `linear-gradient(to right, #fe0705 0%, #fe0705 ${pct}%, #8d8d8d ${pct}%, #8d8d8d 100%)`;
+    }
 
     // Built entirely with DOM APIs (createElement/appendChild), NOT
     // innerHTML — YouTube enforces a Trusted Types CSP policy that
@@ -615,11 +705,11 @@ void main() {
     // restriction entirely, since it never touches the blocked sink.
     function sliderRow(key, label, min, max, step) {
       const row = document.createElement('label');
-      row.style.cssText = 'display:block;margin-top:8px;';
+      row.style.cssText = 'display:block;margin-top:10px;';
       const valSpan = document.createElement('span');
       valSpan.className = 'crt-val';
       valSpan.dataset.for = key;
-      valSpan.style.cssText = 'color:#6f6;float:right;';
+      valSpan.style.cssText = 'color:#1d1d1d;float:right;';
       valSpan.textContent = params[key];
       row.appendChild(document.createTextNode(label + ' '));
       row.appendChild(valSpan);
@@ -630,23 +720,28 @@ void main() {
       input.min = min; input.max = max; input.step = step;
       input.value = params[key];
       input.style.width = '100%';
+      updateSliderFill(input);
       row.appendChild(input);
       return row;
     }
 
     const title = document.createElement('div');
-    title.style.cssText = 'color:#cfc;font-size:13px;margin-bottom:6px;';
-    title.textContent = 'CRT Shader ';
-    const titleHint = document.createElement('span');
-    titleHint.style.cssText = 'color:#6a6;font-size:10px;';
-    titleHint.textContent = '(Ctrl+Alt+C to hide)';
-    title.appendChild(titleHint);
-    panel.appendChild(title);
+title.style.cssText = 'color:#1d1d1d;font-size:14px;margin-bottom:12px;margin-top:12px;display:flex;justify-content:space-between;align-items:baseline;';
+const titleText = document.createElement('span');
+titleText.textContent = 'CRT Shader';
+titleText.style.cssText = 'display:inline-block;transform:scaleY(2.23);transform-origin:left;font-weight:400;';
+title.appendChild(titleText);
+const titleHint = document.createElement('span');
+titleHint.style.cssText = 'color:#8d8d8d;font-size:11px;';
+titleHint.textContent = '(Ctrl+Alt+C to hide)';
+title.appendChild(titleHint);
+panel.appendChild(title);
 
     const enabledRow = document.createElement('label');
     enabledRow.style.cssText = 'display:block;cursor:pointer;';
     const enabledCheckbox = document.createElement('input');
     enabledCheckbox.type = 'checkbox';
+    enabledCheckbox.style.accentColor = '#fe0705';
     enabledCheckbox.dataset.key = 'enabled';
     enabledCheckbox.checked = params.enabled;
     enabledRow.appendChild(enabledCheckbox);
@@ -663,16 +758,28 @@ void main() {
     panel.appendChild(sliderRow('ambientGlow', 'Ambient glow', 0, 0.5, 0.01));
 
     const tintRow = document.createElement('label');
-    tintRow.style.cssText = 'display:block;margin-top:8px;';
-    tintRow.appendChild(document.createTextNode('Tint color'));
-    tintRow.appendChild(document.createElement('br'));
-    const tintInput = document.createElement('input');
-    tintInput.type = 'color';
-    tintInput.dataset.key = 'tintColor';
-    tintInput.value = params.tintColor;
-    tintInput.style.cssText = 'width:100%;height:24px;vertical-align:middle;';
-    tintRow.appendChild(tintInput);
-    panel.appendChild(tintRow);
+tintRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:10px;';
+const tintLabel = document.createElement('span');
+tintLabel.textContent = 'Tint color';
+tintLabel.style.cssText = 'flex:0 0 auto;';
+tintRow.appendChild(tintLabel);
+
+const tintHexInput = document.createElement('input');
+tintHexInput.type = 'text';
+tintHexInput.dataset.key = 'tintColorHex';
+tintHexInput.value = params.tintColor;
+tintHexInput.spellcheck = false;
+tintHexInput.style.cssText = 'flex:1 1 auto;min-width:0;font-family:inherit;font-size:13px;color:#1d1d1d;background:#fff;border:1.5px solid #e2e2e2;border-radius:4px;padding:3px 6px;';
+tintRow.appendChild(tintHexInput);
+
+const tintSwatch = document.createElement('input');
+tintSwatch.type = 'color';
+tintSwatch.dataset.key = 'tintColor';
+tintSwatch.value = params.tintColor;
+tintSwatch.style.cssText = 'flex:0 0 auto;width:26px;height:26px;padding:0;border:1.5px solid #e2e2e2;border-radius:4px;cursor:pointer;';
+tintRow.appendChild(tintSwatch);
+
+panel.appendChild(tintRow);
 
     panel.appendChild(sliderRow('tintStrength', 'Tint strength', 0, 1, 0.01));
 
@@ -684,12 +791,22 @@ void main() {
       if (e.target.type === 'checkbox') {
         params[key] = e.target.checked;
         if (key === 'enabled') setEffectEnabled(params.enabled);
-      } else if (e.target.type === 'color') {
+            } else if (e.target.type === 'color') {
         params[key] = e.target.value;
+        tintHexInput.value = e.target.value; // keep the text field in sync
+      } else if (e.target.type === 'text' && key === 'tintColorHex') {
+        const hex = e.target.value.trim();
+        if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
+          params.tintColor = hex;
+          tintSwatch.value = hex; // keep the swatch in sync, only once valid
+        }
+        // if it's not a valid hex yet (still mid-typing), don't touch
+        // params at all — let them keep typing without fighting them
       } else {
         params[key] = parseFloat(e.target.value);
         const valSpan = panel.querySelector(`.crt-val[data-for="${key}"]`);
         if (valSpan) valSpan.textContent = params[key];
+        updateSliderFill(e.target);
       }
       saveParams(params);
     });
@@ -741,6 +858,7 @@ void main() {
       stopped = true;
       playerWrap.remove();
       panel.remove();
+      sliderStyleTag.remove();
       video.style.visibility = '';
       video.removeEventListener('loadstart', resetVideoTexture);
       video.removeEventListener('emptied', resetVideoTexture);
