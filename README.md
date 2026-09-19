@@ -53,9 +53,9 @@ sessions on the same YouTube video (same playback/scrolling
 pattern), one with the script disabled and one enabled, then compared
 composited-frame timing and the content tab's CPU usage between the
 two. Steady 60fps held in both, with the with-script recording showing
-roughly 60% relative CPU increase on that one thread (~39%\u2192~60% of a
+roughly 60% relative CPU increase on that one thread (~39%~60% of a
 single core) and a modest increase in dropped frames specifically
-during scrolling \u2014 not during normal playback. None of this was
+during scrolling not during normal playback. None of this was
 urgent enough to act on. Left here for if it ever does matter (weaker
 hardware, wanting lower battery/CPU draw, etc).
 
