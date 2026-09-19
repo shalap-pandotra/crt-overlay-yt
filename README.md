@@ -9,7 +9,7 @@ dim scenes.
 ## Install
 
 1. Install [Violentmonkey](https://violentmonkey.github.io/) in your browser.
-2. Open `youtube-crt.user.js` from this repo, copy its contents.
+2. Open `crt-overlay.js` from this repo, copy its contents.
 3. In Violentmonkey's dashboard, create a new script and paste it in.
 4. Go to any YouTube video.
 
@@ -23,10 +23,7 @@ saved automatically and persist across reloads.
 
 ## Files
 
-- `youtube-crt.user.js` — the actual userscript.
-- `crt-prototype.html` — a standalone HTML version used during
-  development to test the shader in isolation, before wiring it up to
-  real YouTube. Not needed to use the effect; kept for reference.
+- `crt-overlay.js` — the actual userscript.
 
 ## Known limitations
 
