@@ -184,7 +184,8 @@
         if (typeof rebuildBloomFBOs === 'function') rebuildBloomFBOs();
       }
     }
-    new ResizeObserver(syncPlayerToVideo).observe(video);
+    const videoResizeObserver = new ResizeObserver(syncPlayerToVideo);
+    videoResizeObserver.observe(video);
     syncPlayerToVideo();
 
     // ============================================================
@@ -247,7 +248,7 @@ void main() {
   // actual edge of the visible content, not an edge nothing reaches.
   vec2 pixelPos = uv * uResolution;
   vec2 halfSize = uResolution * 0.5;
-  float cornerRadiusPx = 18.0;
+  float cornerRadiusPx = 12.0;
   vec2 q = abs(pixelPos - halfSize) - halfSize + cornerRadiusPx;
   float roundedDist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - cornerRadiusPx;
 
@@ -267,9 +268,34 @@ void main() {
 
   float edgeAlpha = roundedAlpha * warpAlpha;
   if (edgeAlpha <= 0.001) {
-    gl_FragColor = vec4(0.0);
-    return;
+    discard;
   }
+
+  // How authentic CRTs actually looked at their edges: the phosphor
+  // screen was physically larger than the actively-scanned picture, so
+  // there was a dim band of "lit but no signal" screen between the real
+  // picture and the true edge — the picture faded INTO that band rather
+  // than cutting off sharply against it. Reuses the same two distance
+  // fields as the edge-alpha fade above (roundedDist for the corners,
+  // edgeDistPx for the barrel-warp boundary), just with a much wider
+  // falloff distance, and blends color (not alpha) toward BORDER_COLOR.
+  // The final transparent cutoff at the true outer edge (edgeAlpha,
+  // computed above with the tight ~1.5px AA band) is unchanged — this
+  // only affects what color things fade to just before that happens.
+  // Hardcoded, not user-tunable — deliberately fixed at rgb(63,67,80).
+  const float BORDER_WIDTH_PX = 23.0;
+  const vec3 BORDER_COLOR = vec3(0.247, 0.263, 0.314);
+  // NOTE: combined with multiplication (not max()) — max() would let
+  // whichever boundary is LESS restrictive win, which is exactly what
+  // produced square corners on the border: the barrel-warp edge test
+  // below is a plain axis-aligned "distance to nearest straight side"
+  // (a square, not a curve), and max() let its straight edges poke
+  // through past where the rounded corner wants to cut things off.
+  // Multiplication makes the MORE restrictive (rounded) shape dominate,
+  // same as edgeAlpha above already correctly does.
+  float roundedInsideWide = 1.0 - smoothstep(-BORDER_WIDTH_PX, 0.0, roundedDist);
+  float warpInsideWide = smoothstep(0.0, BORDER_WIDTH_PX, edgeDistPx);
+  float borderMix = 1.0 - (roundedInsideWide * warpInsideWide);
 
   vec2 imgUv = coverUv(uv, uResolution, uImgSize);
 
@@ -291,6 +317,38 @@ void main() {
   float scanMul = mix(1.0, (0.55 + 0.45 * scanline), uScan);
   col *= scanMul;
   col *= vig;
+  // Dot-matrix border fade — the same technique as the printed ceramic
+  // "frit" dot pattern on car/bus windshields: no continuous color
+  // blend at all, just a grid of dots whose SIZE scales with borderMix
+  // (0 = invisible, tiny; 1 = large enough to fully cover its cell,
+  // reading as solid). The graduality comes entirely from dot
+  // density/size increasing toward the edge, not from a smooth fade.
+  // Uses pixelPos (screen space, already computed above) so the dot
+  // grid stays a clean, undistorted grid regardless of the barrel warp
+  // — physically sensible too, since a real frit pattern is printed on
+  // the glass itself, not warped along with whatever's behind it.
+  const float DOT_CELL_PX = 2.0;
+  vec2 cellCoord = mod(pixelPos, DOT_CELL_PX) - DOT_CELL_PX * 0.5;
+  // Max radius is LARGER than half the cell (0.5) so adjacent dots
+  // actually overlap and merge into a solid border at full strength —
+  // exactly half would only let them touch at a single point per edge,
+  // always leaving small diamond-shaped gaps at the corners no matter
+  // how far into the border you are.
+  float maxDotRadius = DOT_CELL_PX * 0.5;
+  // sqrt(borderMix), not borderMix directly — perceived dot "size" is
+  // closer to AREA than radius, and area scales as radius squared, so a
+  // plain linear radius ramp looks like nothing happens for most of the
+  // band and then suddenly balloons late. Taking the square root here
+  // makes dot AREA increase linearly across the band instead, which
+  // reads as a much more evenly-paced, gradual growth.
+  float dotRadius = sqrt(borderMix) * maxDotRadius;
+  // Without this, the dot's own AA falloff (dotRadius ± 1px) still
+  // leaves a faint ~1px phantom dot at every cell center even when
+  // dotRadius is meant to be exactly zero deep inside the video —
+  // this kills that residual instead of letting it show everywhere.
+  float dotPresence = smoothstep(0.0, 1.0, dotRadius);
+  float inDot = dotPresence * (1.0 - smoothstep(dotRadius - 1.0, dotRadius + 1.0, length(cellCoord)));
+  col = mix(col, BORDER_COLOR, inDot);
 
   gl_FragColor = vec4(col, edgeAlpha);
 }`;
@@ -346,7 +404,13 @@ void main() {
     // which it obviously is here (unlike the file:// prototype).
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    // Flip-Y only makes sense for the real video upload below (a DOM
+    // element) — Firefox specifically warns that combining it with a
+    // raw TypedArray upload like this placeholder pixel is deprecated,
+    // since there's no meaningful "orientation" to flip for a solid
+    // color. Explicitly false here rather than leaving whatever state
+    // a previous call left behind.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -363,7 +427,18 @@ void main() {
     // showing a frozen ghost frame instead.
     function resetVideoTexture() {
       gl.bindTexture(gl.TEXTURE_2D, tex);
+      // Same reasoning as above: this is a raw array, not the video
+      // element, so flip-Y needs to be explicitly off here regardless
+      // of what uploadVideoFrame() last left it set to.
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+      // A new source might not have the same DRM/tainted-canvas problem
+      // the previous one did — give it a fresh chance rather than
+      // staying permanently fallen-back for the rest of the page's life.
+      if (videoUploadFailed) {
+        videoUploadFailed = false;
+        applyEffectVisibility();
+      }
     }
     // 'loadstart' fires as soon as the browser begins loading a new
     // source (i.e. right when video.src/currentSrc changes) — exactly
@@ -374,12 +449,13 @@ void main() {
     video.addEventListener('emptied', resetVideoTexture);
 
     // If texImage2D on the video ever throws (e.g. a tainted-canvas
-    // SecurityError), we log it once — loudly, with the real message —
-    // rather than let it propagate up and silently kill the entire
-    // render loop (an uncaught exception here would stop the
-    // requestAnimationFrame(render) call at the bottom of render(),
-    // freezing everything on the last successful frame with no
-    // indication why).
+    // SecurityError — DRM'd rentals/purchases are the likely trigger),
+    // we log it once and fall back to showing the REAL video instead of
+    // leaving a permanently dead black canvas sitting in front of
+    // content our shader can never actually read. videoUploadFailed
+    // resets on 'loadstart'/'emptied' (see resetVideoTexture below), so
+    // a later, non-protected video gets a fresh chance rather than
+    // staying disabled for the rest of the page's life.
     let videoUploadFailed = false;
     function uploadVideoFrame() {
       if (video.readyState < 2) return; // not enough data yet
@@ -390,7 +466,8 @@ void main() {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
       } catch (err) {
         videoUploadFailed = true;
-        console.error('[CRT] texImage2D on the video element failed — this usually means the browser is treating the video as tainted/cross-origin and refusing to let WebGL read its pixels. Full error:', err);
+        console.error('[CRT] texImage2D on the video element failed — this usually means the browser is treating the video as tainted/cross-origin (DRM-protected content is a likely cause) and refusing to let WebGL read its pixels. Falling back to the real video. Full error:', err);
+        applyEffectVisibility();
       }
     }
 
@@ -408,6 +485,10 @@ void main() {
     function makeFBO(w, h) {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
+      // Allocating empty storage (null data) — not a DOM element, so
+      // flip-Y needs to be explicitly off here too, same reasoning as
+      // the placeholder/reset uploads above.
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -628,7 +709,7 @@ void main() {
       border: '1.5px solid #e2e2e2', display: 'none',
       maxHeight: '90vh', overflowY: 'auto',
       boxShadow: '0 4px 14px #bebebe',
-      paddingRight: '32px',
+      paddingRight: '22px',
     });
 
     // Cross-browser two-tone slider track (filled portion vs remaining
@@ -651,14 +732,14 @@ void main() {
 }
 #crt-panel input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 9px; height: 9px;
+  width: 13px; height: 13px;
   border-radius: 50%;
   background: #fe0705;
   cursor: pointer;
   margin-top: -5px;
 }
 #crt-panel input[type=range]::-moz-range-thumb {
-  width: 9px; height: 9px;
+  width: 13px; height: 13px;
   border-radius: 50%;
   background: #fe0705;
   border: none;
@@ -728,16 +809,16 @@ void main() {
     }
 
     const title = document.createElement('div');
-title.style.cssText = 'color:#1d1d1d;font-size:14px;margin-bottom:12px;margin-top:12px;display:flex;justify-content:space-between;align-items:baseline;';
-const titleText = document.createElement('span');
-titleText.textContent = 'CRT Shader';
-titleText.style.cssText = 'display:inline-block;transform:scaleY(2.23);transform-origin:left;font-weight:400;';
-title.appendChild(titleText);
-const titleHint = document.createElement('span');
-titleHint.style.cssText = 'color:#8d8d8d;font-size:11px;';
-titleHint.textContent = '(Ctrl+Alt+C to hide)';
-title.appendChild(titleHint);
-panel.appendChild(title);
+    title.style.cssText = 'color:#1d1d1d;font-size:14px;margin-bottom:8px;margin-top:8px;display:flex;justify-content:space-between;align-items:baseline;';
+    const titleText = document.createElement('span');
+    titleText.textContent = 'CRT Shader';
+    titleText.style.cssText = 'display:inline-block;transform:scaleY(2.23);transform-origin:left;font-weight:400;';
+    title.appendChild(titleText);
+    const titleHint = document.createElement('span');
+    titleHint.style.cssText = 'color:#8d8d8d;font-size:11px;';
+    titleHint.textContent = '(Ctrl+Alt+C to hide)';
+    title.appendChild(titleHint);
+    panel.appendChild(title);
 
     const enabledRow = document.createElement('label');
     enabledRow.style.cssText = 'display:block;cursor:pointer;';
@@ -757,31 +838,31 @@ panel.appendChild(title);
     panel.appendChild(sliderRow('vig', 'Vignette', 0, 1, 0.01));
     panel.appendChild(sliderRow('bleed', 'Color bleed', 0, 3, 0.01));
     panel.appendChild(sliderRow('bloomThresh', 'Bloom threshold', 0, 1, 0.01));
-    panel.appendChild(sliderRow('ambientGlow', 'Ambient glow', 0, 0.5, 0.01));
+    panel.appendChild(sliderRow('ambientGlow', 'Ambient glow', 0, 1, 0.01));
 
     const tintRow = document.createElement('label');
-tintRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:10px;';
-const tintLabel = document.createElement('span');
-tintLabel.textContent = 'Tint color';
-tintLabel.style.cssText = 'flex:0 0 auto;';
-tintRow.appendChild(tintLabel);
+    tintRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:10px;';
+    const tintLabel = document.createElement('span');
+    tintLabel.textContent = 'Tint color';
+    tintLabel.style.cssText = 'flex:0 0 auto;';
+    tintRow.appendChild(tintLabel);
 
-const tintHexInput = document.createElement('input');
-tintHexInput.type = 'text';
-tintHexInput.dataset.key = 'tintColorHex';
-tintHexInput.value = params.tintColor;
-tintHexInput.spellcheck = false;
-tintHexInput.style.cssText = 'flex:1 1 auto;min-width:0;font-family:inherit;font-size:13px;color:#1d1d1d;background:#fff;border:1.5px solid #e2e2e2;border-radius:4px;padding:3px 6px;';
-tintRow.appendChild(tintHexInput);
+    const tintHexInput = document.createElement('input');
+    tintHexInput.type = 'text';
+    tintHexInput.dataset.key = 'tintColorHex';
+    tintHexInput.value = params.tintColor;
+    tintHexInput.spellcheck = false;
+    tintHexInput.style.cssText = 'flex:1 1 auto;min-width:0;font-family:inherit;font-size:13px;color:#1d1d1d;background:#fff;border:1.5px solid #e2e2e2;border-radius:4px;padding:3px 6px;';
+    tintRow.appendChild(tintHexInput);
 
-const tintSwatch = document.createElement('input');
-tintSwatch.type = 'color';
-tintSwatch.dataset.key = 'tintColor';
-tintSwatch.value = params.tintColor;
-tintSwatch.style.cssText = 'flex:0 0 auto;width:26px;height:26px;padding:0;border:1.5px solid #e2e2e2;border-radius:4px;cursor:pointer;';
-tintRow.appendChild(tintSwatch);
+    const tintSwatch = document.createElement('input');
+    tintSwatch.type = 'color';
+    tintSwatch.dataset.key = 'tintColor';
+    tintSwatch.value = params.tintColor;
+    tintSwatch.style.cssText = 'flex:0 0 auto;width:26px;height:26px;padding:0;border:1.5px solid #e2e2e2;border-radius:4px;cursor:pointer;';
+    tintRow.appendChild(tintSwatch);
 
-panel.appendChild(tintRow);
+    panel.appendChild(tintRow);
 
     panel.appendChild(sliderRow('tintStrength', 'Tint strength', 0, 1, 0.01));
 
@@ -792,18 +873,16 @@ panel.appendChild(tintRow);
       if (!key) return;
       if (e.target.type === 'checkbox') {
         params[key] = e.target.checked;
-        if (key === 'enabled') setEffectEnabled(params.enabled);
-            } else if (e.target.type === 'color') {
+        if (key === 'enabled') applyEffectVisibility();
+      } else if (e.target.type === 'color') {
         params[key] = e.target.value;
-        tintHexInput.value = e.target.value; // keep the text field in sync
+        if (key === 'tintColor') tintHexInput.value = e.target.value;
       } else if (e.target.type === 'text' && key === 'tintColorHex') {
         const hex = e.target.value.trim();
         if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
           params.tintColor = hex;
-          tintSwatch.value = hex; // keep the swatch in sync, only once valid
+          tintSwatch.value = hex;
         }
-        // if it's not a valid hex yet (still mid-typing), don't touch
-        // params at all — let them keep typing without fighting them
       } else {
         params[key] = parseFloat(e.target.value);
         const valSpan = panel.querySelector(`.crt-val[data-for="${key}"]`);
@@ -821,20 +900,30 @@ panel.appendChild(tintRow);
     // remapped by some keyboard layouts when a modifier is held. Ignored
     // while typing in an input/textarea/contenteditable field (YouTube's
     // search box, comments, etc.) so it doesn't interfere with typing.
-    window.addEventListener('keydown', (e) => {
+    // Named (not inline) so teardown() can remove it later — this
+    // listener is on `window`, not any element that gets cleaned up
+    // just by removing our DOM nodes, so without an explicit removeEventListener
+    // it outlives this whole instance indefinitely.
+    function handlePanelToggleKey(e) {
       if (!e.ctrlKey || !e.altKey || e.metaKey || e.code !== 'KeyC') return;
       const active = document.activeElement;
       const isTyping = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
       if (isTyping) return;
       panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
       e.preventDefault();
-    });
+    }
+    window.addEventListener('keydown', handlePanelToggleKey);
 
-    // Master on/off: when disabled, restore the real video and hide the
-    // player canvas rather than tearing anything down — this needs to be
-    // instantly reversible without reinitializing the whole pipeline.
-    function setEffectEnabled(on) {
-      if (on) {
+    // Single source of truth for whether the effect should actually be
+    // showing right now: the user's own on/off toggle AND the upload
+    // pipeline not having permanently failed on this video. Combining
+    // both into one function (rather than two separate places each
+    // setting video.style.visibility) avoids them fighting over the
+    // same state — e.g. the user having the effect enabled while a
+    // failed DRM'd video correctly still shows the real video anyway.
+    function applyEffectVisibility() {
+      const active = params.enabled && !videoUploadFailed;
+      if (active) {
         video.style.visibility = 'hidden';
         playerWrap.style.display = '';
       } else {
@@ -842,7 +931,7 @@ panel.appendChild(tintRow);
         playerWrap.style.display = 'none';
       }
     }
-    setEffectEnabled(params.enabled);
+    applyEffectVisibility();
 
     // ============================================================
     // Main render loop.
@@ -864,6 +953,20 @@ panel.appendChild(tintRow);
       video.style.visibility = '';
       video.removeEventListener('loadstart', resetVideoTexture);
       video.removeEventListener('emptied', resetVideoTexture);
+      window.removeEventListener('keydown', handlePanelToggleKey);
+      videoResizeObserver.disconnect();
+      // Explicitly release the WebGL context rather than relying on
+      // garbage collection to eventually reclaim it once the canvas is
+      // removed from the DOM. This matters because browsers cap the
+      // number of SIMULTANEOUSLY LIVE WebGL contexts per tab (commonly
+      // ~8-16) — without this, repeatedly attaching to short-lived
+      // <video> elements (e.g. hovering many homepage preview thumbnails
+      // in one session, each triggering its own init/teardown cycle)
+      // could accumulate contexts fast enough to hit that ceiling before
+      // GC ever catches up, causing the browser to start forcibly
+      // evicting the oldest ones out from under other instances.
+      const loseContextExt = gl.getExtension('WEBGL_lose_context');
+      if (loseContextExt) loseContextExt.loseContext();
       console.log('[CRT] video element removed from page, shader stopped. Watching for a new one...');
       // Re-arm: the video that just disappeared might have been a
       // transient placeholder YouTube swaps out during page load (seen
