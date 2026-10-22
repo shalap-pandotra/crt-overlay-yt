@@ -16,19 +16,14 @@
 (function () {
   'use strict';
 
-  // ============================================================
-  // Tuned defaults from the prototyping sessions, now live-adjustable
-  // via an in-page control panel (Ctrl+Alt+C to toggle) rather than fixed.
-  // Persisted to localStorage so settings survive reloads/new videos.
-  // ============================================================
-  const DEFAULT_PARAMS = {
+    const DEFAULT_PARAMS = {
     enabled: true,
-    scan: 0.47, scanCount: 390, bloom: 0.75, warp: 0.055,
-    vig: 0.29, bleed: 0.29, bloomThresh: 0.67, ambientGlow: 0.5,
-    tintColor: '#8080c0',
-    tintStrength: 0.13,
-    renderScale: 1.0, // 1.0 = full quality. Lower for weaker GPUs — fewer
-                       // internal pixels rendered, upscaled to fit.
+    gamma: 2.46, phosphor: 0.34, whitePoint: 0.3, afterglow: 0.035,
+    scan: 0.47, scanCount: 770, bloom: 0.65, warp: 0.08,
+    vig: 0.22, bleed: 0.32, bloomThresh: 0.66, ambientGlow: 0.54,
+    tintColor: '#a4a400',
+    tintStrength: 0.1,
+    renderScale: 1.0, 
   };
 
   const STORAGE_KEY = 'crt-shader-settings';
@@ -53,21 +48,11 @@
 
   const params = loadParams();
 
-  // Converts a "#rrggbb" hex string to a [r, g, b] triple in 0-1 range,
-  // for feeding directly into a vec3 shader uniform.
   function hexToRgb01(hex) {
     const n = parseInt(hex.replace('#', ''), 16);
     return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
   }
 
-  // ============================================================
-  // Wait for YouTube's real video element to exist. YouTube is an
-  // SPA, so on first script load the player may not be there yet.
-  // This is deliberately minimal — it does NOT yet handle
-  // navigating between videos after the fact (that's step 6:
-  // handling SPA navigation). This only handles "wait for the
-  // player to first appear."
-  // ============================================================
   function waitForVideo(callback) {
     const existing = document.querySelector('#movie_player video') || document.querySelector('video');
     if (existing) {
@@ -87,41 +72,11 @@
   waitForVideo(initCRT);
 
   function initCRT(video) {
-    // ---- inject the player canvas directly into YouTube's own player DOM ----
-    // Inserted as the very next sibling after <video>, inside the same
-    // parent. This is the key fix for two stacking bugs: (1) YouTube's
-    // own controls are separate overlay elements painted *after* the
-    // video in DOM order — inserting here, before them, means normal
-    // DOM paint order puts them above us automatically, no z-index
-    // guessing needed; (2) using `position: absolute` scoped to this
-    // local parent (instead of `position: fixed` on document.body with
-    // a huge z-index) means we no longer escape the page's normal
-    // stacking order, so YouTube's sticky header correctly paints over
-    // us on scroll instead of the other way around.
-    //
-    // IMPORTANT: we deliberately do NOT force playerParent to
-    // `position: relative` here, even if it's currently `static`. CSS
-    // absolute positioning resolves against the nearest POSITIONED
-    // ancestor, skipping static ones — and YouTube's own script sets
-    // video.style.top/left assuming that resolution point is whatever
-    // ancestor is ACTUALLY positioned further up (e.g. #movie_player),
-    // not this immediate parent. Forcing this parent to `relative`
-    // inserts a new, closer positioning boundary that YouTube's own
-    // math doesn't know about, silently breaking its previously-correct
-    // offset — which is exactly what caused the video to disappear
-    // (its top/left ended up resolving against the wrong box entirely).
-    // By leaving this parent's position alone, our absolutely-positioned
-    // playerWrap resolves against the SAME true positioned ancestor that
-    // video already does, since both skip over the same static parent.
     const playerParent = video.parentNode;
 
     const playerWrap = document.createElement('div');
     playerWrap.id = 'crt-player-wrap';
     Object.assign(playerWrap.style, {
-      // left/top/width/height are set explicitly by syncPlayerToVideo(),
-      // computed from video's own actual rect — NOT from `inset: 0`,
-      // which would only be correct if this wrap's containing block
-      // happened to exactly match video's box, which isn't guaranteed.
       position: 'absolute', overflow: 'hidden', pointerEvents: 'none',
       borderRadius: '8px',
     });
@@ -131,9 +86,6 @@
     playerWrap.appendChild(canvas);
     playerParent.insertBefore(playerWrap, video.nextSibling);
 
-    // The real video element gets visually hidden (not removed —
-    // audio/decode/etc. still need it) since the canvas draws the
-    // shaded version directly on top of it in the exact same spot.
     video.style.visibility = 'hidden';
 
     const gl = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: false });
@@ -143,48 +95,13 @@
     }
 
     let sceneFBO, brightFBO, blurFBO_A, blurFBO_B;
+    let histFBO_A, histFBO_B, historyNeedsClear = true, lastPersistT = -1;
 
-    // ---- live tracking of the real video element's SIZE ----
-    // Position is no longer tracked here at all — `inset: 0` on
-    // playerWrap means it automatically matches its parent's box,
-    // including on scroll, resize, fullscreen, and theater-mode toggles,
-    // with zero JS involved. Only the WebGL backing store (canvas.width/
-    // height, viewport, bloom FBOs) needs updating, and only when the
-    // rendered SIZE actually changes.
-    //
-    // CORRECTION: that assumption doesn't hold here. playerWrap's CSS
-    // `inset: 0` matches playerParent's box, but video's own rect can
-    // legitimately differ from its parent container's box (crop/cover
-    // positioning, or — on this experimental "grid" player specifically
-    // — the container may be sized for scroll/peek behavior separate
-    // from the actual visible video area). Relying on CSS to coincide
-    // with video's real box was the likely cause of the canvas ending up
-    // positioned somewhere other than where the video actually is.
-    // Instead, compute playerWrap's left/top/width/height explicitly
-    // from video's own actual rect every time, converted into
-    // coordinates relative to playerParent (its real containing block),
-    // rather than trusting `inset: 0` to line up by coincidence.
     let lastW = -1, lastH = -1, lastRenderScale = -1;
-    // Explicit readiness guard, not implicit hoisting — syncPlayerToVideo()
-    // is called once immediately below (initial sizing) long before the
-    // rest of the pipeline (tex, shader programs, bloom FBOs) is set up
-    // further down this script. Calling uploadVideoFrame()/renderRealBloom()
-    // during that first early call would reference `tex` etc. before
-    // their `const` declarations have run — the exact same class of
-    // ordering bug already hit (and fixed) twice earlier in this
-    // project. This flag flips true only once everything genuinely
-    // exists, and gates the forced-redraw-after-resize logic below.
     let pipelineReady = false;
-    // Populated by renderRealBloom() each frame with the actual
-    // post-render-scale-compensation values currently being applied to
-    // the shader — read by updateEffectiveDisplays() so the panel can
-    // show what's REALLY happening, separate from the base values the
-    // sliders themselves control (see that function for why these two
-    // things are deliberately kept separate).
     let lastEffectiveValues = null;
     function syncPlayerToVideo() {
       const r = video.getBoundingClientRect();
-      // if the video has zero size (e.g. hidden/ad transition), skip
       if (r.width < 2 || r.height < 2) return;
 
       const containerRect = playerParent.getBoundingClientRect();
@@ -194,44 +111,15 @@
       playerWrap.style.height = r.height + 'px';
 
       const w = Math.round(r.width), h = Math.round(r.height);
-      // Tolerance band (>1px), not exact equality — without this, a
-      // player whose layout size flickers by even a single pixel
-      // frame-to-frame (this runs every frame while playing, not just
-      // on real resizes) would thrash the expensive bloom-FBO rebuild
-      // below repeatedly, which is a very plausible cause of random,
-      // comes-and-goes jitter during otherwise normal playback. Real
-      // resizes (cinema mode, window resize, fullscreen) change
-      // dimensions by far more than 1-2px, so this doesn't miss those.
-      // Also rebuild if renderScale itself just changed (live slider
-      // tweak), since that changes the target backing-store size too
-      // even though the on-screen CSS size (w/h here) hasn't moved.
       if (Math.abs(w - lastW) > 1 || Math.abs(h - lastH) > 1 || params.renderScale !== lastRenderScale) {
         lastW = w; lastH = h;
         lastRenderScale = params.renderScale;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        // renderScale renders the actual shader pipeline at FEWER
-        // internal pixels than the video's on-screen CSS size (canvas
-        // CSS width/height stay at 100% throughout), then lets the
-        // browser's own smooth upscaling stretch the result to fit —
-        // the same "Dynamic Resolution Scaling" technique games use for
-        // weaker GPUs, since fragment shader cost scales directly with
-        // pixel count. Defaults to 1.0 (no reduction, current behavior
-        // unchanged) — this is an opt-in dial for slower machines, not
-        // a change to anyone's existing experience.
         const scale = params.renderScale;
         canvas.width = Math.max(1, Math.round(w * dpr * scale));
         canvas.height = Math.max(1, Math.round(h * dpr * scale));
         gl.viewport(0, 0, canvas.width, canvas.height);
         if (typeof rebuildBloomFBOs === 'function') rebuildBloomFBOs();
-        // Force one immediate redraw of whatever frame we already have,
-        // regardless of play state. Without this: resizing the canvas
-        // (fullscreen toggle, render-scale change, cinema mode, window
-        // resize — any of them) clears it, and since rendering is driven
-        // by requestVideoFrameCallback (only fires on a genuinely NEW
-        // decoded frame), a resize while PAUSED would leave the canvas
-        // blank until playback resumes and finally produces a fresh
-        // frame — exactly the bug that surfaced as "fullscreen toggle
-        // while paused goes blank until you hit play."
         if (pipelineReady) {
           try {
             uploadVideoFrame();
@@ -246,9 +134,6 @@
     videoResizeObserver.observe(video);
     syncPlayerToVideo();
 
-    // ============================================================
-    // Shaders — identical to the validated prototype.
-    // ============================================================
     const vertSrc = `
 attribute vec2 aPos;
 varying vec2 vUv;
@@ -274,6 +159,9 @@ uniform float uBleed;
 uniform vec3 uTintColor;
 uniform float uTintStrength;
 uniform float uRenderScale;
+uniform float uGamma;
+uniform float uPhosphor;
+uniform float uWhitePoint;
 
 vec2 barrel(vec2 uv, float amt) {
   vec2 cc = uv - 0.5;
@@ -370,7 +258,29 @@ void main() {
   float r = texture2D(uTex, imgUv - vec2(aberr, 0.0)).r;
   float g = texture2D(uTex, imgUv).g;
   float b = texture2D(uTex, imgUv + vec2(aberr, 0.0)).b;
-  vec3 imgCol = vec3(r, g, b);
+    vec3 imgCol = vec3(r, g, b);
+
+  // CRT color emulation. Done in linear light: decode the sRGB-ish
+  // signal, remap primaries and white point, re-encode, then apply the
+  // CRT gamma curve. All three default to identity (gamma 2.2,
+  // phosphor 0, white point 0) so nothing changes until tuned.
+  vec3 lin = pow(max(imgCol, 0.0), vec3(2.2));
+  // Approximate P22 phosphor primaries: rows sum to 1 so white stays
+  // white. Red leans slightly orange, green slightly yellow, gamut a bit
+  // narrower than a modern panel. Approximation, meant to be eyeballed.
+  vec3 crtLin = vec3(
+    dot(lin, vec3(0.86, 0.12, 0.02)),
+    dot(lin, vec3(0.06, 0.90, 0.04)),
+    dot(lin, vec3(0.01, 0.06, 0.93))
+  );
+  lin = mix(lin, crtLin, uPhosphor);
+  // Cool ~9300K white common on consumer CRTs. Normalized so the max
+  // channel is 1.0, avoiding clipping.
+  lin *= mix(vec3(1.0), vec3(0.85, 0.92, 1.0), uWhitePoint);
+  imgCol = pow(lin, vec3(1.0 / 2.2));
+  // CRT gamma relative to the 2.2 the content was mastered for. Above
+  // 2.2 darkens midtones and adds punch, the classic CRT contrast feel.
+  imgCol = pow(imgCol, vec3(uGamma / 2.2));
 
   float y = uv.y * uScanCount;
   float scanline = sin(y * 3.14159) * 0.5 + 0.5;
@@ -464,21 +374,12 @@ void main() {
     const uTintColor = gl.getUniformLocation(prog, 'uTintColor');
     const uTintStrength = gl.getUniformLocation(prog, 'uTintStrength');
     const uRenderScale = gl.getUniformLocation(prog, 'uRenderScale');
-
+    const uGamma = gl.getUniformLocation(prog, 'uGamma');
+    const uPhosphor = gl.getUniformLocation(prog, 'uPhosphor');
+    const uWhitePoint = gl.getUniformLocation(prog, 'uWhitePoint');
     gl.disable(gl.BLEND);
-
-    // ---- video texture ----
-    // Sourced directly from YouTube's own <video> element, uploaded
-    // fresh every frame. Requires the page to be served over http(s),
-    // which it obviously is here (unlike the file:// prototype).
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    // Flip-Y only makes sense for the real video upload below (a DOM
-    // element) — Firefox specifically warns that combining it with a
-    // raw TypedArray upload like this placeholder pixel is deprecated,
-    // since there's no meaningful "orientation" to flip for a solid
-    // color. Explicitly false here rather than leaving whatever state
-    // a previous call left behind.
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -486,45 +387,21 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-    // Resets the texture back to a solid black 1x1 pixel — matching what
-    // a native <video> element renders once its decode buffer is
-    // invalidated (e.g. on src change). Without this, our texture just
-    // keeps whatever the last uploaded frame was forever, since
-    // uploadVideoFrame() below skips uploading while readyState < 2 —
-    // which is exactly what produced the "stale frame from the previous
-    // video" bug: real YouTube shows black during that gap, we were
-    // showing a frozen ghost frame instead.
-    function resetVideoTexture() {
+      function resetVideoTexture() {
+      historyNeedsClear = true;
       gl.bindTexture(gl.TEXTURE_2D, tex);
-      // Same reasoning as above: this is a raw array, not the video
-      // element, so flip-Y needs to be explicitly off here regardless
-      // of what uploadVideoFrame() last left it set to.
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
-      // A new source might not have the same DRM/tainted-canvas problem
-      // the previous one did — give it a fresh chance rather than
-      // staying permanently fallen-back for the rest of the page's life.
       if (videoUploadFailed) {
         videoUploadFailed = false;
         applyEffectVisibility();
       }
     }
-    // 'loadstart' fires as soon as the browser begins loading a new
-    // source (i.e. right when video.src/currentSrc changes) — exactly
-    // the moment we want to drop the stale frame. 'emptied' covers the
-    // case where the media resource is reset without a new source lined
-    // up yet.
     video.addEventListener('loadstart', resetVideoTexture);
     video.addEventListener('emptied', resetVideoTexture);
+    function markHistoryStale() { historyNeedsClear = true; }
+    video.addEventListener('seeking', markHistoryStale);
 
-    // If texImage2D on the video ever throws (e.g. a tainted-canvas
-    // SecurityError — DRM'd rentals/purchases are the likely trigger),
-    // we log it once and fall back to showing the REAL video instead of
-    // leaving a permanently dead black canvas sitting in front of
-    // content our shader can never actually read. videoUploadFailed
-    // resets on 'loadstart'/'emptied' (see resetVideoTexture below), so
-    // a later, non-protected video gets a fresh chance rather than
-    // staying disabled for the rest of the page's life.
     let videoUploadFailed = false;
     function uploadVideoFrame() {
       if (video.readyState < 2) return; // not enough data yet
@@ -539,10 +416,6 @@ void main() {
         applyEffectVisibility();
       }
     }
-
-    // ============================================================
-    // Real bloom pipeline — identical to the validated prototype.
-    // ============================================================
     function makeProgram(fs) {
       const p = gl.createProgram();
       gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vertSrc));
@@ -554,9 +427,6 @@ void main() {
     function makeFBO(w, h) {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
-      // Allocating empty storage (null data) — not a DOM element, so
-      // flip-Y needs to be explicitly off here too, same reasoning as
-      // the placeholder/reset uploads above.
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -566,10 +436,6 @@ void main() {
       const fbo = gl.createFramebuffer();
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
-      // DIAGNOSTIC: a framebuffer can silently fail to complete (e.g. if
-      // w/h exceeds this GPU's texture size limit) — draws to an
-      // incomplete framebuffer are no-ops, which would look exactly like
-      // "bloom stopped contributing anything" without any thrown error.
       const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
       if (status !== gl.FRAMEBUFFER_COMPLETE) {
         console.error(`[CRT] framebuffer incomplete at ${w}x${h}, status=${status} (maxTextureSize=${gl.getParameter(gl.MAX_TEXTURE_SIZE)})`);
@@ -657,6 +523,26 @@ void main() {
   gl_FragColor = vec4(sceneSample.rgb + bloom * uBloomStrength, sceneSample.a);
 }`;
 
+    const persistFragSrc = `
+precision mediump float;
+varying vec2 vUv;
+uniform sampler2D uCurrent;
+uniform sampler2D uHistory;
+uniform vec3 uDecay;
+void main() {
+  // Phosphor afterglow: show whichever is brighter, the new frame or the
+  // faded previous one. Using max (not add or mix) means only bright
+  // things leave trails and the current image never gets washed out.
+  // Alpha always comes from the current frame so the edge mask stays exact.
+  vec4 cur = texture2D(uCurrent, vUv);
+  vec3 hist = texture2D(uHistory, vUv).rgb * uDecay;
+  gl_FragColor = vec4(max(cur.rgb, hist), cur.a);
+}`;
+    const persistProg = makeProgram(persistFragSrc);
+    const u_persist_uCurrent = gl.getUniformLocation(persistProg, 'uCurrent');
+    const u_persist_uHistory = gl.getUniformLocation(persistProg, 'uHistory');
+    const u_persist_uDecay = gl.getUniformLocation(persistProg, 'uDecay');
+
     const brightProg = makeProgram(brightFragSrc);
     const blurProg = makeProgram(blurFragSrc);
     const compositeProg = makeProgram(compositeFragSrc);
@@ -683,10 +569,6 @@ void main() {
       const bw = Math.max(1, Math.floor(w / 4));
       const bh = Math.max(1, Math.floor(h / 4));
       console.log(`[CRT] rebuildBloomFBOs: canvas=${w}x${h} bloomTargets=${bw}x${bh}`);
-      // free the previous set before creating new ones — otherwise
-      // repeatedly toggling cinema mode / resizing leaks GPU memory
-      // indefinitely, since the old textures/framebuffers are never
-      // referenced again but also never explicitly freed.
       deleteFBO(sceneFBO);
       deleteFBO(brightFBO);
       deleteFBO(blurFBO_A);
@@ -695,33 +577,17 @@ void main() {
       brightFBO = makeFBO(bw, bh);
       blurFBO_A = makeFBO(bw, bh);
       blurFBO_B = makeFBO(bw, bh);
+      deleteFBO(histFBO_A);
+      deleteFBO(histFBO_B);
+      histFBO_A = makeFBO(w, h);
+      histFBO_B = makeFBO(w, h);
+      historyNeedsClear = true;
     }
     rebuildBloomFBOs();
 
     function renderRealBloom(t) {
-      // Render-scale compensation: lowering render scale shrinks the
-      // internal resolution while the display size stays the same, which
-      // has real side effects on effects whose visual character depends
-      // on pixel-relative math — scanlines start undersampling/aliasing
-      // (too many periods for too few actual rows), and bloom's blur
-      // kernel covers a larger fraction of the smaller image, spreading
-      // and brightening more than intended. These aren't precise inverse
-      // formulas (there isn't one — this is a lossy resampling effect),
-      // just reasonable compensation to keep the LOOK roughly consistent
-      // across scales. Deliberately computed here, NOT by mutating
-      // params.* itself — the panel sliders keep showing your actual
-      // chosen values untouched, so dragging render scale back to 1.0
-      // exactly restores them with zero drift, and you can still
-      // override any of this by moving the sliders yourself afterward.
       const rs = params.renderScale;
       const effScanCount = Math.max(10, params.scanCount * (0.5 + 0.5 * rs));
-      // Both reformulated to guarantee exactly 1.0x at rs=1 (full render
-      // scale = identical to no compensation at all), while keeping the
-      // same low-end (rs->0) multiplier you already tuned by eye. The
-      // previous versions of both drifted from 1.0x even at full scale
-      // (bloom overshot to 1.2x, scan undershot to 0.5x) since they were
-      // tuned only by looking at low scale, without checking rs=1 still
-      // matched original behavior.
       const effScan = params.scan * (0.2 + 0.8 * rs);
       const effBloom = params.bloom * (0.4 + 0.6 * rs);
       const effBloomThresh = Math.min(1, params.bloomThresh + (1 - rs) * 0.15);
@@ -747,14 +613,57 @@ void main() {
       gl.uniform3f(uTintColor, tintRgb[0], tintRgb[1], tintRgb[2]);
       gl.uniform1f(uTintStrength, params.tintStrength);
       gl.uniform1f(uRenderScale, params.renderScale);
+      gl.uniform1f(uGamma, params.gamma);
+      gl.uniform1f(uPhosphor, params.phosphor);
+      gl.uniform1f(uWhitePoint, params.whitePoint);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      // Phosphor afterglow pass. Off (0) skips it entirely, zero cost.
+      let sceneForBloom = sceneFBO.tex;
+      if (params.afterglow > 0) {
+        if (historyNeedsClear) {
+          for (const f of [histFBO_A, histFBO_B]) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, f.fbo);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+          }
+          historyNeedsClear = false;
+          lastPersistT = t;
+        }
+        // Fade by real elapsed time, so trail length doesn't depend on
+        // the video's framerate. Clamped so a long pause just clears it.
+        const dt = Math.min(0.25, Math.max(0, (t - lastPersistT) / 1000));
+        lastPersistT = t;
+        const tau = params.afterglow;
+        // Green phosphor lingers longest, blue shortest.
+        const dR = Math.exp(-dt / (tau * 0.8));
+        const dG = Math.exp(-dt / (tau * 1.3));
+        const dB = Math.exp(-dt / (tau * 0.5));
+        gl.bindFramebuffer(gl.FRAMEBUFFER, histFBO_B.fbo);
+        gl.viewport(0, 0, histFBO_B.w, histFBO_B.h);
+        gl.useProgram(persistProg);
+        bindQuad(persistProg);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, sceneFBO.tex);
+        gl.uniform1i(u_persist_uCurrent, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, histFBO_A.tex);
+        gl.uniform1i(u_persist_uHistory, 1);
+        gl.uniform3f(u_persist_uDecay, dR, dG, dB);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.activeTexture(gl.TEXTURE0);
+        [histFBO_A, histFBO_B] = [histFBO_B, histFBO_A];
+        sceneForBloom = histFBO_A.tex;
+      } else {
+        historyNeedsClear = true;
+      }
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, brightFBO.fbo);
       gl.viewport(0, 0, brightFBO.w, brightFBO.h);
       gl.useProgram(brightProg);
       bindQuad(brightProg);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, sceneFBO.tex);
+      gl.bindTexture(gl.TEXTURE_2D, sceneForBloom);
       gl.uniform1i(u_bright_uScene, 0);
       gl.uniform1f(u_bright_uThreshold, effBloomThresh);
       gl.uniform2f(u_bright_uSceneTexel, 1 / sceneFBO.w, 1 / sceneFBO.h);
@@ -784,7 +693,7 @@ void main() {
       gl.useProgram(compositeProg);
       bindQuad(compositeProg);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, sceneFBO.tex);
+      gl.bindTexture(gl.TEXTURE_2D, sceneForBloom);
       gl.uniform1i(u_comp_uScene, 0);
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, src.tex);
@@ -792,11 +701,6 @@ void main() {
       gl.uniform1f(u_comp_uBloomStrength, effBloom);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
-
-    // ============================================================
-    // Control panel — hidden by default, toggled with Ctrl+Alt+C. Every
-    // parameter is live-adjustable and persisted to localStorage.
-    // ============================================================
     const panel = document.createElement('div');
     panel.id = 'crt-panel';
     Object.assign(panel.style, {
@@ -810,14 +714,6 @@ void main() {
       paddingRight: '22px',
     });
 
-    // Cross-browser two-tone slider track (filled portion vs remaining
-    // track) can't be done with a single native CSS property — it needs
-    // -webkit/-moz-specific pseudo-elements for the thumb, and the fill
-    // itself is done by computing a plain CSS gradient and applying it
-    // as the input's own background (updated on every change), rather
-    // than relying on ::-webkit-slider-runnable-track / -moz-range-progress,
-    // which differ enough between browsers that hand-computing the
-    // gradient ourselves is more predictable.
     const sliderStyleTag = document.createElement('style');
     sliderStyleTag.textContent = `
 #crt-panel input[type=range] {
@@ -878,12 +774,6 @@ void main() {
       input.style.background = `linear-gradient(to right, #fe0705 0%, #fe0705 ${pct}%, #8d8d8d ${pct}%, #8d8d8d 100%)`;
     }
 
-    // Built entirely with DOM APIs (createElement/appendChild), NOT
-    // innerHTML — YouTube enforces a Trusted Types CSP policy that
-    // outright blocks assigning plain strings to .innerHTML (a security
-    // feature against DOM-injection attacks, with no exception for
-    // extensions/userscripts). Direct DOM construction sidesteps that
-    // restriction entirely, since it never touches the blocked sink.
     function sliderRow(key, label, min, max, step) {
       const row = document.createElement('label');
       row.style.cssText = 'display:block;margin-top:10px;';
@@ -906,14 +796,6 @@ void main() {
       return row;
     }
 
-    // Shows what's ACTUALLY being applied to the shader right now,
-    // alongside (not instead of) the base value each slider controls.
-    // Deliberately doesn't move the slider thumbs themselves to the
-    // compensated value — doing that would fight any attempt to drag
-    // the slider yourself, since we'd snap it back every frame. Only
-    // touches these four (scan, scanCount, bloom, bloomThresh), since
-    // those are the only ones render-scale compensation actually
-    // touches — everything else always shows exactly what you set.
     function updateEffectiveDisplays() {
       if (panel.style.display === 'none') return; // no point updating a hidden panel
       if (!lastEffectiveValues) return;
@@ -988,7 +870,10 @@ void main() {
     panel.appendChild(tintRow);
 
     panel.appendChild(sliderRow('tintStrength', 'Tint strength', 0, 1, 0.01));
-
+    panel.appendChild(sliderRow('gamma', 'CRT gamma', 1.8, 3.0, 0.01));
+    panel.appendChild(sliderRow('phosphor', 'Phosphor color', 0, 1, 0.01));
+    panel.appendChild(sliderRow('whitePoint', 'Cool white point', 0, 1, 0.01));
+    panel.appendChild(sliderRow('afterglow', 'Phosphor afterglow', 0, 0.2, 0.005));
     document.body.appendChild(panel);
 
     panel.addEventListener('input', (e) => {
@@ -1013,15 +898,6 @@ void main() {
         updateSliderFill(e.target);
       }
       saveParams(params);
-      // Force one immediate redraw with the new setting applied. Without
-      // this: rendering is driven by requestVideoFrameCallback (fires
-      // only on a genuinely NEW decoded video frame), so tweaking ANY
-      // slider while paused would have nowhere to trigger a redraw until
-      // playback resumes and produces a fresh frame — every setting
-      // would silently fail to preview live while paused, not just this
-      // one. Only re-runs the shader (renderRealBloom), not a full
-      // texture re-upload — the video frame itself hasn't changed, only
-      // our own parameters have.
       if (pipelineReady && params.enabled) {
         try {
           renderRealBloom(performance.now());
@@ -1031,18 +907,6 @@ void main() {
       }
     });
 
-    // Ctrl+Alt+C toggles the panel (not just Alt+C — holding Alt alone
-    // can trigger Windows Firefox's hidden menu-bar/mnemonic mode, which
-    // swallows the following keypress before the page ever sees it;
-    // requiring both modifiers together avoids that entirely). Uses
-    // e.code (the physical key) rather than e.key, since e.key can be
-    // remapped by some keyboard layouts when a modifier is held. Ignored
-    // while typing in an input/textarea/contenteditable field (YouTube's
-    // search box, comments, etc.) so it doesn't interfere with typing.
-    // Named (not inline) so teardown() can remove it later — this
-    // listener is on `window`, not any element that gets cleaned up
-    // just by removing our DOM nodes, so without an explicit removeEventListener
-    // it outlives this whole instance indefinitely.
     function handlePanelToggleKey(e) {
       if (!e.ctrlKey || !e.altKey || e.metaKey || e.code !== 'KeyC') return;
       const active = document.activeElement;
@@ -1053,13 +917,6 @@ void main() {
     }
     window.addEventListener('keydown', handlePanelToggleKey);
 
-    // Single source of truth for whether the effect should actually be
-    // showing right now: the user's own on/off toggle AND the upload
-    // pipeline not having permanently failed on this video. Combining
-    // both into one function (rather than two separate places each
-    // setting video.style.visibility) avoids them fighting over the
-    // same state — e.g. the user having the effect enabled while a
-    // failed DRM'd video correctly still shows the real video anyway.
     function applyEffectVisibility() {
       const active = params.enabled && !videoUploadFailed;
       if (active) {
@@ -1071,17 +928,6 @@ void main() {
       }
     }
     applyEffectVisibility();
-
-    // ============================================================
-    // Main render loop.
-    // ============================================================
-    // NOTE: this does NOT yet handle YouTube's SPA navigation (clicking
-    // to a different video without a full page reload) — that's step 6.
-    // What it DOES handle: if the video this instance is attached to
-    // gets removed from the page entirely (e.g. navigating away to the
-    // homepage), stop cleanly instead of leaving a frozen, unplayable
-    // ghost frame on screen. This is a graceful bail-out, not a re-init;
-    // if a new video appears later, this instance will NOT attach to it.
     let stopped = false;
     function teardown() {
       if (stopped) return;
@@ -1092,67 +938,14 @@ void main() {
       video.style.visibility = '';
       video.removeEventListener('loadstart', resetVideoTexture);
       video.removeEventListener('emptied', resetVideoTexture);
+      video.removeEventListener('seeking', markHistoryStale);
       window.removeEventListener('keydown', handlePanelToggleKey);
       videoResizeObserver.disconnect();
-      // Explicitly release the WebGL context rather than relying on
-      // garbage collection to eventually reclaim it once the canvas is
-      // removed from the DOM. This matters because browsers cap the
-      // number of SIMULTANEOUSLY LIVE WebGL contexts per tab (commonly
-      // ~8-16) — without this, repeatedly attaching to short-lived
-      // <video> elements (e.g. hovering many homepage preview thumbnails
-      // in one session, each triggering its own init/teardown cycle)
-      // could accumulate contexts fast enough to hit that ceiling before
-      // GC ever catches up, causing the browser to start forcibly
-      // evicting the oldest ones out from under other instances.
       const loseContextExt = gl.getExtension('WEBGL_lose_context');
       if (loseContextExt) loseContextExt.loseContext();
       console.log('[CRT] video element removed from page, shader stopped. Watching for a new one...');
-      // Re-arm: the video that just disappeared might have been a
-      // transient placeholder YouTube swaps out during page load (seen
-      // in practice: a 300x150 default-sized element that gets replaced
-      // by the real player moments later), not necessarily the user
-      // navigating away. Rather than permanently giving up, go back to
-      // watching for whatever video appears next — this makes a fresh
-      // page load self-healing instead of a coin flip on which video
-      // element we happened to grab first.
       waitForVideo(initCRT);
     }
-
-    // Skips the actual GPU/CPU work (texture upload + full shader
-    // pipeline) whenever this TAB isn't visible — i.e. it's a background
-    // tab, minimized, or another window is focused. This is deliberately
-    // based on tab visibility (document.hidden), NOT on whether the
-    // video itself is paused: an earlier version skipped rendering
-    // whenever the video was paused, which also (unintentionally) meant
-    // the ACTIVE tab you're watching would stop and restart its render
-    // loop on every pause/seek/resume — and restarting after an idle gap
-    // has its own catch-up cost, which is exactly what caused jitter on
-    // seeking or resuming. Tying this to tab visibility instead fixes
-    // the original problem (an idle/preview <video> on some OTHER
-    // YouTube tab burning a full 60fps loop forever, competing for the
-    // same shared GPU process as the tab you're actually watching)
-    // without ever touching the render cadence of the tab you're
-    // actively looking at, paused or not.
-    //
-    // The actual texture upload + bloom render is now driven by
-    // requestVideoFrameCallback (see below) rather than blindly running
-    // every requestAnimationFrame tick, wherever that's available — it
-    // fires exactly when the browser has a genuinely NEW decoded video
-    // frame ready, at the video's own real framerate, and simply never
-    // fires at all while paused (no new frames exist to callback about).
-    // That solves the earlier "paused-but-visible tab still redraws an
-    // identical frame 60x/sec" and "re-uploads the same frame every
-    // tick regardless of whether it changed" costs in one correct
-    // architectural move, using the browser's own authoritative signal
-    // instead of guessing from .paused/.ended (which is exactly the
-    // guesswork that caused the seek/resume jitter bug previously).
-    // Position/size tracking (syncPlayerToVideo) still runs every rAF
-    // tick regardless, since the player's on-screen position can change
-    // from scrolling even while the video itself isn't producing new
-    // frames (e.g. a paused video being scrolled past).
-    // Everything the forced-redraw-after-resize logic in
-    // syncPlayerToVideo() needs (tex, shader programs, bloom FBOs) is
-    // fully set up by this point — safe to flip the readiness guard now.
     pipelineReady = true;
 
     const hasRVFC = typeof video.requestVideoFrameCallback === 'function';
