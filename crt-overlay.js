@@ -16,9 +16,9 @@
 (function () {
   'use strict';
 
-    const DEFAULT_PARAMS = {
+  const DEFAULT_PARAMS = {
     enabled: true,
-    gamma: 2.46, phosphor: 0.34, whitePoint: 0.3, afterglow: 0.035,
+    gamma: 2.46, saturation: 1.23, phosphor: 0.34, whitePoint: 0.3, afterglow: 0.035,
     scan: 0.47, scanCount: 770, bloom: 0.65, warp: 0.08,
     vig: 0.22, bleed: 0.32, bloomThresh: 0.66, ambientGlow: 0.54,
     tintColor: '#a4a400',
@@ -138,8 +138,8 @@
 attribute vec2 aPos;
 varying vec2 vUv;
 void main() {
-  vUv = aPos * 0.5 + 0.5;
-  gl_Position = vec4(aPos, 0.0, 1.0);
+vUv = aPos * 0.5 + 0.5;
+gl_Position = vec4(aPos, 0.0, 1.0);
 }`;
 
     const fragSrc = `
@@ -162,173 +162,180 @@ uniform float uRenderScale;
 uniform float uGamma;
 uniform float uPhosphor;
 uniform float uWhitePoint;
+uniform float uSaturation;
 
 vec2 barrel(vec2 uv, float amt) {
-  vec2 cc = uv - 0.5;
-  float dist = dot(cc, cc);
-  return uv + cc * dist * amt;
+vec2 cc = uv - 0.5;
+float dist = dot(cc, cc);
+return uv + cc * dist * amt;
 }
 
 vec2 coverUv(vec2 uv, vec2 screenRes, vec2 imgRes) {
-  float screenAspect = screenRes.x / screenRes.y;
-  float imgAspect = imgRes.x / imgRes.y;
-  vec2 scale = vec2(1.0);
-  if (screenAspect > imgAspect) {
-    scale.y = imgAspect / screenAspect;
-  } else {
-    scale.x = screenAspect / imgAspect;
-  }
-  vec2 centered = (uv - 0.5) * scale + 0.5;
-  return centered;
+float screenAspect = screenRes.x / screenRes.y;
+float imgAspect = imgRes.x / imgRes.y;
+vec2 scale = vec2(1.0);
+if (screenAspect > imgAspect) {
+scale.y = imgAspect / screenAspect;
+} else {
+scale.x = screenAspect / imgAspect;
+}
+vec2 centered = (uv - 0.5) * scale + 0.5;
+return centered;
 }
 
 void main() {
-  vec2 uv = barrel(vUv, uWarp);
+vec2 uv = barrel(vUv, uWarp);
 
-  // Rounded-corner frame around the actual video content. Computed
-  // against uv (the WARPED coordinate, same space the barrel-warp
-  // out-of-bounds test below already uses) rather than the raw screen
-  // coordinate — the barrel warp already pulls content in from the
-  // canvas edges, so rounding against the canvas's own outer edge had
-  // no visible effect at all: that boundary was already fully
-  // transparent well before reaching it. This has to bite into the
-  // actual edge of the visible content, not an edge nothing reaches.
-  vec2 pixelPos = uv * uResolution;
-  vec2 halfSize = uResolution * 0.5;
-  // Multiplied by uRenderScale so this stays a CONSTANT on-screen size
-  // regardless of render scale — without this, lowering render scale
-  // (which shrinks the internal canvas resolution while the browser
-  // stretches the result back up to the same display size) makes any
-  // pixel-based measurement like this appear to grow, since "12 pixels"
-  // means something different at a smaller internal resolution.
-  float cornerRadiusPx = 12.0 * uRenderScale;
-  vec2 q = abs(pixelPos - halfSize) - halfSize + cornerRadiusPx;
-  float roundedDist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - cornerRadiusPx;
+// Rounded-corner frame around the actual video content. Computed
+// against uv (the WARPED coordinate, same space the barrel-warp
+// out-of-bounds test below already uses) rather than the raw screen
+// coordinate — the barrel warp already pulls content in from the
+// canvas edges, so rounding against the canvas's own outer edge had
+// no visible effect at all: that boundary was already fully
+// transparent well before reaching it. This has to bite into the
+// actual edge of the visible content, not an edge nothing reaches.
+vec2 pixelPos = uv * uResolution;
+vec2 halfSize = uResolution * 0.5;
+// Multiplied by uRenderScale so this stays a CONSTANT on-screen size
+// regardless of render scale — without this, lowering render scale
+// (which shrinks the internal canvas resolution while the browser
+// stretches the result back up to the same display size) makes any
+// pixel-based measurement like this appear to grow, since "12 pixels"
+// means something different at a smaller internal resolution.
+float cornerRadiusPx = 12.0 * uRenderScale;
+vec2 q = abs(pixelPos - halfSize) - halfSize + cornerRadiusPx;
+float roundedDist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - cornerRadiusPx;
 
-  // Anti-aliased edges: fade alpha smoothly over ~1.5px around each
-  // boundary instead of a hard discard. A binary cutoff can't produce a
-  // smooth edge on a curve by definition — every pixel is either fully
-  // in or fully out, which is exactly what staircases on the rounded
-  // corners. This alpha has to survive all the way through the bloom
-  // pipeline to the final composite (see compositeFragSrc below), or
-  // it'll get silently discarded there instead.
-  float aaPx = 1.5;
-  float roundedAlpha = 1.0 - smoothstep(-aaPx, aaPx, roundedDist);
+// Anti-aliased edges: fade alpha smoothly over ~1.5px around each
+// boundary instead of a hard discard. A binary cutoff can't produce a
+// smooth edge on a curve by definition — every pixel is either fully
+// in or fully out, which is exactly what staircases on the rounded
+// corners. This alpha has to survive all the way through the bloom
+// pipeline to the final composite (see compositeFragSrc below), or
+// it'll get silently discarded there instead.
+float aaPx = 1.5;
+float roundedAlpha = 1.0 - smoothstep(-aaPx, aaPx, roundedDist);
 
-  vec2 edgeDistUv = min(uv, 1.0 - uv); // distance to nearest uv-space edge (negative if outside)
-  float edgeDistPx = min(edgeDistUv.x * uResolution.x, edgeDistUv.y * uResolution.y);
-  float warpAlpha = smoothstep(0.0, aaPx, edgeDistPx);
+vec2 edgeDistUv = min(uv, 1.0 - uv); // distance to nearest uv-space edge (negative if outside)
+float edgeDistPx = min(edgeDistUv.x * uResolution.x, edgeDistUv.y * uResolution.y);
+float warpAlpha = smoothstep(0.0, aaPx, edgeDistPx);
 
-  float edgeAlpha = roundedAlpha * warpAlpha;
-  if (edgeAlpha <= 0.001) {
-    discard;
-  }
+float edgeAlpha = roundedAlpha * warpAlpha;
+if (edgeAlpha <= 0.001) {
+discard;
+}
 
-  // How authentic CRTs actually looked at their edges: the phosphor
-  // screen was physically larger than the actively-scanned picture, so
-  // there was a dim band of "lit but no signal" screen between the real
-  // picture and the true edge — the picture faded INTO that band rather
-  // than cutting off sharply against it. Reuses the same two distance
-  // fields as the edge-alpha fade above (roundedDist for the corners,
-  // edgeDistPx for the barrel-warp boundary), just with a much wider
-  // falloff distance, and blends color (not alpha) toward BORDER_COLOR.
-  // The final transparent cutoff at the true outer edge (edgeAlpha,
-  // computed above with the tight ~1.5px AA band) is unchanged — this
-  // only affects what color things fade to just before that happens.
-  // Hardcoded, not user-tunable — deliberately fixed at rgb(63,67,80).
-  // Same render-scale compensation as cornerRadiusPx above — no longer
-  // a compile-time const since it now depends on a uniform.
-  float BORDER_WIDTH_PX = 23.0 * uRenderScale;
-  const vec3 BORDER_COLOR = vec3(0.247, 0.263, 0.314);
-  // NOTE: combined with multiplication (not max()) — max() would let
-  // whichever boundary is LESS restrictive win, which is exactly what
-  // produced square corners on the border: the barrel-warp edge test
-  // below is a plain axis-aligned "distance to nearest straight side"
-  // (a square, not a curve), and max() let its straight edges poke
-  // through past where the rounded corner wants to cut things off.
-  // Multiplication makes the MORE restrictive (rounded) shape dominate,
-  // same as edgeAlpha above already correctly does.
-  float roundedInsideWide = 1.0 - smoothstep(-BORDER_WIDTH_PX, 0.0, roundedDist);
-  float warpInsideWide = smoothstep(0.0, BORDER_WIDTH_PX, edgeDistPx);
-  float borderMix = 1.0 - (roundedInsideWide * warpInsideWide);
+// How authentic CRTs actually looked at their edges: the phosphor
+// screen was physically larger than the actively-scanned picture, so
+// there was a dim band of "lit but no signal" screen between the real
+// picture and the true edge — the picture faded INTO that band rather
+// than cutting off sharply against it. Reuses the same two distance
+// fields as the edge-alpha fade above (roundedDist for the corners,
+// edgeDistPx for the barrel-warp boundary), just with a much wider
+// falloff distance, and blends color (not alpha) toward BORDER_COLOR.
+// The final transparent cutoff at the true outer edge (edgeAlpha,
+// computed above with the tight ~1.5px AA band) is unchanged — this
+// only affects what color things fade to just before that happens.
+// Hardcoded, not user-tunable — deliberately fixed at rgb(63,67,80).
+// Same render-scale compensation as cornerRadiusPx above — no longer
+// a compile-time const since it now depends on a uniform.
+float BORDER_WIDTH_PX = 23.0 * uRenderScale;
+const vec3 BORDER_COLOR = vec3(0.247, 0.263, 0.314);
+// NOTE: combined with multiplication (not max()) — max() would let
+// whichever boundary is LESS restrictive win, which is exactly what
+// produced square corners on the border: the barrel-warp edge test
+// below is a plain axis-aligned "distance to nearest straight side"
+// (a square, not a curve), and max() let its straight edges poke
+// through past where the rounded corner wants to cut things off.
+// Multiplication makes the MORE restrictive (rounded) shape dominate,
+// same as edgeAlpha above already correctly does.
+float roundedInsideWide = 1.0 - smoothstep(-BORDER_WIDTH_PX, 0.0, roundedDist);
+float warpInsideWide = smoothstep(0.0, BORDER_WIDTH_PX, edgeDistPx);
+float borderMix = 1.0 - (roundedInsideWide * warpInsideWide);
 
-  vec2 imgUv = coverUv(uv, uResolution, uImgSize);
+vec2 imgUv = coverUv(uv, uResolution, uImgSize);
 
-  float aberr = uBleed * 0.006;
-  float r = texture2D(uTex, imgUv - vec2(aberr, 0.0)).r;
-  float g = texture2D(uTex, imgUv).g;
-  float b = texture2D(uTex, imgUv + vec2(aberr, 0.0)).b;
-    vec3 imgCol = vec3(r, g, b);
+float aberr = uBleed * 0.006;
+float r = texture2D(uTex, imgUv - vec2(aberr, 0.0)).r;
+float g = texture2D(uTex, imgUv).g;
+float b = texture2D(uTex, imgUv + vec2(aberr, 0.0)).b;
+vec3 imgCol = vec3(r, g, b);
 
-  // CRT color emulation. Done in linear light: decode the sRGB-ish
-  // signal, remap primaries and white point, re-encode, then apply the
-  // CRT gamma curve. All three default to identity (gamma 2.2,
-  // phosphor 0, white point 0) so nothing changes until tuned.
-  vec3 lin = pow(max(imgCol, 0.0), vec3(2.2));
-  // Approximate P22 phosphor primaries: rows sum to 1 so white stays
-  // white. Red leans slightly orange, green slightly yellow, gamut a bit
-  // narrower than a modern panel. Approximation, meant to be eyeballed.
-  vec3 crtLin = vec3(
-    dot(lin, vec3(0.86, 0.12, 0.02)),
-    dot(lin, vec3(0.06, 0.90, 0.04)),
-    dot(lin, vec3(0.01, 0.06, 0.93))
-  );
-  lin = mix(lin, crtLin, uPhosphor);
-  // Cool ~9300K white common on consumer CRTs. Normalized so the max
-  // channel is 1.0, avoiding clipping.
-  lin *= mix(vec3(1.0), vec3(0.85, 0.92, 1.0), uWhitePoint);
-  imgCol = pow(lin, vec3(1.0 / 2.2));
-  // CRT gamma relative to the 2.2 the content was mastered for. Above
-  // 2.2 darkens midtones and adds punch, the classic CRT contrast feel.
-  imgCol = pow(imgCol, vec3(uGamma / 2.2));
+// CRT color emulation. Done in linear light: decode the sRGB-ish
+// signal, remap primaries and white point, re-encode, then apply the
+// CRT gamma curve. All three default to identity (gamma 2.2,
+// phosphor 0, white point 0) so nothing changes until tuned.
+vec3 lin = pow(max(imgCol, 0.0), vec3(2.2));
+// Approximate P22 phosphor primaries: rows sum to 1 so white stays
+// white. Red leans slightly orange, green slightly yellow, gamut a bit
+// narrower than a modern panel. Approximation, meant to be eyeballed.
+vec3 crtLin = vec3(
+dot(lin, vec3(0.86, 0.12, 0.02)),
+dot(lin, vec3(0.06, 0.90, 0.04)),
+dot(lin, vec3(0.01, 0.06, 0.93))
+);
+lin = mix(lin, crtLin, uPhosphor);
+// Cool ~9300K white common on consumer CRTs. Normalized so the max
+// channel is 1.0, avoiding clipping.
+lin *= mix(vec3(1.0), vec3(0.85, 0.92, 1.0), uWhitePoint);
+imgCol = pow(lin, vec3(1.0 / 2.2));
+// CRT gamma relative to the 2.2 the content was mastered for. Above
+// 2.2 darkens midtones and adds punch, the classic CRT contrast feel.
+imgCol = pow(imgCol, vec3(uGamma / 2.2));
+// Saturation, applied after the phosphor/white point/gamma emulation so
+// it boosts the vividness of the CRT-colored result rather than fighting
+// it. 1.0 = unchanged. Consumer CRTs were commonly set well above
+// neutral, which is a big part of the remembered look.
+float sLuma = dot(imgCol, vec3(0.2126, 0.7152, 0.0722));
+imgCol = max(mix(vec3(sLuma), imgCol, uSaturation), 0.0);
 
-  float y = uv.y * uScanCount;
-  float scanline = sin(y * 3.14159) * 0.5 + 0.5;
-  scanline = pow(scanline, 2.0);
+float y = uv.y * uScanCount;
+float scanline = sin(y * 3.14159) * 0.5 + 0.5;
+scanline = pow(scanline, 2.0);
 
-  vec2 cc = uv - 0.5;
-  float vig = smoothstep(0.9, 0.25, length(cc));
-  vig = mix(1.0, vig, uVig);
+vec2 cc = uv - 0.5;
+float vig = smoothstep(0.9, 0.25, length(cc));
+vig = mix(1.0, vig, uVig);
 
-  vec3 col = mix(imgCol, imgCol * uTintColor, uTintStrength);
-  float scanMul = mix(1.0, (0.55 + 0.45 * scanline), uScan);
-  col *= scanMul;
-  col *= vig;
-  // Dot-matrix border fade — the same technique as the printed ceramic
-  // "frit" dot pattern on car/bus windshields: no continuous color
-  // blend at all, just a grid of dots whose SIZE scales with borderMix
-  // (0 = invisible, tiny; 1 = large enough to fully cover its cell,
-  // reading as solid). The graduality comes entirely from dot
-  // density/size increasing toward the edge, not from a smooth fade.
-  // Uses pixelPos (screen space, already computed above) so the dot
-  // grid stays a clean, undistorted grid regardless of the barrel warp
-  // — physically sensible too, since a real frit pattern is printed on
-  // the glass itself, not warped along with whatever's behind it.
-  // Same render-scale compensation as above.
-  float DOT_CELL_PX = 2.0 * uRenderScale;
-  vec2 cellCoord = mod(pixelPos, DOT_CELL_PX) - DOT_CELL_PX * 0.5;
-  // Max radius is LARGER than half the cell (0.5) so adjacent dots
-  // actually overlap and merge into a solid border at full strength —
-  // exactly half would only let them touch at a single point per edge,
-  // always leaving small diamond-shaped gaps at the corners no matter
-  // how far into the border you are.
-  float maxDotRadius = DOT_CELL_PX * 0.5;
-  // sqrt(borderMix), not borderMix directly — perceived dot "size" is
-  // closer to AREA than radius, and area scales as radius squared, so a
-  // plain linear radius ramp looks like nothing happens for most of the
-  // band and then suddenly balloons late. Taking the square root here
-  // makes dot AREA increase linearly across the band instead, which
-  // reads as a much more evenly-paced, gradual growth.
-  float dotRadius = sqrt(borderMix) * maxDotRadius;
-  // Without this, the dot's own AA falloff (dotRadius ± 1px) still
-  // leaves a faint ~1px phantom dot at every cell center even when
-  // dotRadius is meant to be exactly zero deep inside the video —
-  // this kills that residual instead of letting it show everywhere.
-  float dotPresence = smoothstep(0.0, 1.0, dotRadius);
-  float inDot = dotPresence * (1.0 - smoothstep(dotRadius - 1.0, dotRadius + 1.0, length(cellCoord)));
-  col = mix(col, BORDER_COLOR, inDot);
+vec3 col = mix(imgCol, imgCol * uTintColor, uTintStrength);
+float scanMul = mix(1.0, (0.55 + 0.45 * scanline), uScan);
+col *= scanMul;
+col *= vig;
+// Dot-matrix border fade — the same technique as the printed ceramic
+// "frit" dot pattern on car/bus windshields: no continuous color
+// blend at all, just a grid of dots whose SIZE scales with borderMix
+// (0 = invisible, tiny; 1 = large enough to fully cover its cell,
+// reading as solid). The graduality comes entirely from dot
+// density/size increasing toward the edge, not from a smooth fade.
+// Uses pixelPos (screen space, already computed above) so the dot
+// grid stays a clean, undistorted grid regardless of the barrel warp
+// — physically sensible too, since a real frit pattern is printed on
+// the glass itself, not warped along with whatever's behind it.
+// Same render-scale compensation as above.
+float DOT_CELL_PX = 2.0 * uRenderScale;
+vec2 cellCoord = mod(pixelPos, DOT_CELL_PX) - DOT_CELL_PX * 0.5;
+// Max radius is LARGER than half the cell (0.5) so adjacent dots
+// actually overlap and merge into a solid border at full strength —
+// exactly half would only let them touch at a single point per edge,
+// always leaving small diamond-shaped gaps at the corners no matter
+// how far into the border you are.
+float maxDotRadius = DOT_CELL_PX * 0.5;
+// sqrt(borderMix), not borderMix directly — perceived dot "size" is
+// closer to AREA than radius, and area scales as radius squared, so a
+// plain linear radius ramp looks like nothing happens for most of the
+// band and then suddenly balloons late. Taking the square root here
+// makes dot AREA increase linearly across the band instead, which
+// reads as a much more evenly-paced, gradual growth.
+float dotRadius = sqrt(borderMix) * maxDotRadius;
+// Without this, the dot's own AA falloff (dotRadius ± 1px) still
+// leaves a faint ~1px phantom dot at every cell center even when
+// dotRadius is meant to be exactly zero deep inside the video —
+// this kills that residual instead of letting it show everywhere.
+float dotPresence = smoothstep(0.0, 1.0, dotRadius);
+float inDot = dotPresence * (1.0 - smoothstep(dotRadius - 1.0, dotRadius + 1.0, length(cellCoord)));
+col = mix(col, BORDER_COLOR, inDot);
 
-  gl_FragColor = vec4(col, edgeAlpha);
+gl_FragColor = vec4(col, edgeAlpha);
 }`;
 
     function compile(context, type, src) {
@@ -377,6 +384,7 @@ void main() {
     const uGamma = gl.getUniformLocation(prog, 'uGamma');
     const uPhosphor = gl.getUniformLocation(prog, 'uPhosphor');
     const uWhitePoint = gl.getUniformLocation(prog, 'uWhitePoint');
+    const uSaturation = gl.getUniformLocation(prog, 'uSaturation');
     gl.disable(gl.BLEND);
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -387,7 +395,7 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-      function resetVideoTexture() {
+    function resetVideoTexture() {
       historyNeedsClear = true;
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
@@ -452,36 +460,36 @@ uniform float uThreshold;
 uniform vec2 uSceneTexel;
 uniform float uAmbientGlow;
 void main() {
-  // Sample a small neighborhood in the FULL-RES scene (not just one
-  // point) and take the brightest hit. This runs at quarter resolution,
-  // so a single point-sample can systematically miss thin bright
-  // details (like closely-spaced scanline peaks) if the sparse sampling
-  // grid happens to land between them — which becomes MORE likely, not
-  // less, at larger canvas sizes, since the same scanline pattern
-  // becomes physically thinner relative to the quarter-res sampling
-  // interval. Taking the max over a 3x3 neighborhood makes the bright-
-  // pass robust to that alignment problem at any resolution.
-  vec3 best = vec3(0.0);
-  float bestLum = -1.0;
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      vec2 offset = vec2(float(dx), float(dy)) * uSceneTexel;
-      vec3 c = texture2D(uScene, vUv + offset).rgb;
-      float lum = dot(c, vec3(0.299, 0.587, 0.114));
-      if (lum > bestLum) { bestLum = lum; best = c; }
-    }
-  }
-  // Threshold-gated highlight bloom (unchanged) PLUS a small always-on
-  // ambient term proportional to the scene's own brightness everywhere
-  // — not gated by the threshold at all. Without this, a scene with no
-  // strong highlights contributes literally zero bloom (excess = 0
-  // everywhere), while scanlines/vignette/tint keep darkening it
-  // regardless — all of the CRT look's cost with none of its glow. The
-  // ambient term guarantees some soft glow is always present,
-  // proportional to whatever's actually on screen, so it never goes
-  // fully dead/flat on dim or low-contrast footage.
-  float excess = max(bestLum - uThreshold, 0.0) * 2.5 + bestLum * uAmbientGlow;
-  gl_FragColor = vec4(best * excess, 1.0);
+// Sample a small neighborhood in the FULL-RES scene (not just one
+// point) and take the brightest hit. This runs at quarter resolution,
+// so a single point-sample can systematically miss thin bright
+// details (like closely-spaced scanline peaks) if the sparse sampling
+// grid happens to land between them — which becomes MORE likely, not
+// less, at larger canvas sizes, since the same scanline pattern
+// becomes physically thinner relative to the quarter-res sampling
+// interval. Taking the max over a 3x3 neighborhood makes the bright-
+// pass robust to that alignment problem at any resolution.
+vec3 best = vec3(0.0);
+float bestLum = -1.0;
+for (int dy = -1; dy <= 1; dy++) {
+for (int dx = -1; dx <= 1; dx++) {
+vec2 offset = vec2(float(dx), float(dy)) * uSceneTexel;
+vec3 c = texture2D(uScene, vUv + offset).rgb;
+float lum = dot(c, vec3(0.299, 0.587, 0.114));
+if (lum > bestLum) { bestLum = lum; best = c; }
+}
+}
+// Threshold-gated highlight bloom (unchanged) PLUS a small always-on
+// ambient term proportional to the scene's own brightness everywhere
+// — not gated by the threshold at all. Without this, a scene with no
+// strong highlights contributes literally zero bloom (excess = 0
+// everywhere), while scanlines/vignette/tint keep darkening it
+// regardless — all of the CRT look's cost with none of its glow. The
+// ambient term guarantees some soft glow is always present,
+// proportional to whatever's actually on screen, so it never goes
+// fully dead/flat on dim or low-contrast footage.
+float excess = max(bestLum - uThreshold, 0.0) * 2.5 + bestLum * uAmbientGlow;
+gl_FragColor = vec4(best * excess, 1.0);
 }`;
 
     const blurFragSrc = `
@@ -491,19 +499,19 @@ uniform sampler2D uTex;
 uniform vec2 uTexelSize;
 uniform vec2 uDir;
 void main() {
-  float weights[5];
-  weights[0] = 0.2270270270;
-  weights[1] = 0.1945945946;
-  weights[2] = 0.1216216216;
-  weights[3] = 0.0540540541;
-  weights[4] = 0.0162162162;
-  vec3 sum = texture2D(uTex, vUv).rgb * weights[0];
-  for (int i = 1; i < 5; i++) {
-    vec2 off = uDir * uTexelSize * float(i);
-    sum += texture2D(uTex, vUv + off).rgb * weights[i];
-    sum += texture2D(uTex, vUv - off).rgb * weights[i];
-  }
-  gl_FragColor = vec4(sum, 1.0);
+float weights[5];
+weights[0] = 0.2270270270;
+weights[1] = 0.1945945946;
+weights[2] = 0.1216216216;
+weights[3] = 0.0540540541;
+weights[4] = 0.0162162162;
+vec3 sum = texture2D(uTex, vUv).rgb * weights[0];
+for (int i = 1; i < 5; i++) {
+vec2 off = uDir * uTexelSize * float(i);
+sum += texture2D(uTex, vUv + off).rgb * weights[i];
+sum += texture2D(uTex, vUv - off).rgb * weights[i];
+}
+gl_FragColor = vec4(sum, 1.0);
 }`;
 
     const compositeFragSrc = `
@@ -513,14 +521,14 @@ uniform sampler2D uScene;
 uniform sampler2D uBloom;
 uniform float uBloomStrength;
 void main() {
-  // Alpha comes from the SCENE texture (which carries the anti-aliased
-  // rounded-corner/barrel-edge mask from the main shader), not
-  // hardcoded to 1.0 — otherwise that soft edge alpha gets silently
-  // discarded here and the final on-screen result is opaque everywhere
-  // regardless of what the scene pass actually computed.
-  vec4 sceneSample = texture2D(uScene, vUv);
-  vec3 bloom = texture2D(uBloom, vUv).rgb;
-  gl_FragColor = vec4(sceneSample.rgb + bloom * uBloomStrength, sceneSample.a);
+// Alpha comes from the SCENE texture (which carries the anti-aliased
+// rounded-corner/barrel-edge mask from the main shader), not
+// hardcoded to 1.0 — otherwise that soft edge alpha gets silently
+// discarded here and the final on-screen result is opaque everywhere
+// regardless of what the scene pass actually computed.
+vec4 sceneSample = texture2D(uScene, vUv);
+vec3 bloom = texture2D(uBloom, vUv).rgb;
+gl_FragColor = vec4(sceneSample.rgb + bloom * uBloomStrength, sceneSample.a);
 }`;
 
     const persistFragSrc = `
@@ -530,13 +538,13 @@ uniform sampler2D uCurrent;
 uniform sampler2D uHistory;
 uniform vec3 uDecay;
 void main() {
-  // Phosphor afterglow: show whichever is brighter, the new frame or the
-  // faded previous one. Using max (not add or mix) means only bright
-  // things leave trails and the current image never gets washed out.
-  // Alpha always comes from the current frame so the edge mask stays exact.
-  vec4 cur = texture2D(uCurrent, vUv);
-  vec3 hist = texture2D(uHistory, vUv).rgb * uDecay;
-  gl_FragColor = vec4(max(cur.rgb, hist), cur.a);
+// Phosphor afterglow: show whichever is brighter, the new frame or the
+// faded previous one. Using max (not add or mix) means only bright
+// things leave trails and the current image never gets washed out.
+// Alpha always comes from the current frame so the edge mask stays exact.
+vec4 cur = texture2D(uCurrent, vUv);
+vec3 hist = texture2D(uHistory, vUv).rgb * uDecay;
+gl_FragColor = vec4(max(cur.rgb, hist), cur.a);
 }`;
     const persistProg = makeProgram(persistFragSrc);
     const u_persist_uCurrent = gl.getUniformLocation(persistProg, 'uCurrent');
@@ -616,6 +624,7 @@ void main() {
       gl.uniform1f(uGamma, params.gamma);
       gl.uniform1f(uPhosphor, params.phosphor);
       gl.uniform1f(uWhitePoint, params.whitePoint);
+      gl.uniform1f(uSaturation, params.saturation);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       // Phosphor afterglow pass. Off (0) skips it entirely, zero cost.
@@ -717,53 +726,53 @@ void main() {
     const sliderStyleTag = document.createElement('style');
     sliderStyleTag.textContent = `
 #crt-panel input[type=range] {
-  -webkit-appearance: none;
-  appearance: none;
-  height: 3px;
-  border-radius: 1.5px;
-  outline: none;
-  background: #8d8d8d;
+-webkit-appearance: none;
+appearance: none;
+height: 3px;
+border-radius: 1.5px;
+outline: none;
+background: #8d8d8d;
 }
 #crt-panel input[type=range]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 13px; height: 13px;
-  border-radius: 50%;
-  background: #fe0705;
-  cursor: pointer;
-  margin-top: -5px;
+-webkit-appearance: none;
+width: 13px; height: 13px;
+border-radius: 50%;
+background: #fe0705;
+cursor: pointer;
+margin-top: -5px;
 }
 #crt-panel input[type=range]::-moz-range-thumb {
-  width: 13px; height: 13px;
-  border-radius: 50%;
-  background: #fe0705;
-  border: none;
-  cursor: pointer;
+width: 13px; height: 13px;
+border-radius: 50%;
+background: #fe0705;
+border: none;
+cursor: pointer;
 }
 #crt-panel input[type=range]::-moz-range-track {
-  height: 3px;
-  border-radius: 1.5px;
-  background: transparent;
+height: 3px;
+border-radius: 1.5px;
+background: transparent;
 }
 #crt-panel input[type=text]:focus,
 #crt-panel input[type=color]:focus {
-  outline: none;
+outline: none;
 }
 #crt-panel {
-  scrollbar-width: thin;
-  scrollbar-color: #d0d0d0 transparent;
+scrollbar-width: thin;
+scrollbar-color: #d0d0d0 transparent;
 }
 #crt-panel::-webkit-scrollbar {
-  width: 6px;
+width: 6px;
 }
 #crt-panel::-webkit-scrollbar-track {
-  background: transparent;
+background: transparent;
 }
 #crt-panel::-webkit-scrollbar-thumb {
-  background: #d0d0d0;
-  border-radius: 3px;
+background: #d0d0d0;
+border-radius: 3px;
 }
 #crt-panel::-webkit-scrollbar-thumb:hover {
-  background: #bebebe;
+background: #bebebe;
 }
 `;
     document.head.appendChild(sliderStyleTag);
@@ -873,6 +882,7 @@ void main() {
     panel.appendChild(sliderRow('gamma', 'CRT gamma', 1.8, 3.0, 0.01));
     panel.appendChild(sliderRow('phosphor', 'Phosphor color', 0, 1, 0.01));
     panel.appendChild(sliderRow('whitePoint', 'Cool white point', 0, 1, 0.01));
+    panel.appendChild(sliderRow('saturation', 'Saturation', 0, 2, 0.01));
     panel.appendChild(sliderRow('afterglow', 'Phosphor afterglow', 0, 0.2, 0.005));
     document.body.appendChild(panel);
 
