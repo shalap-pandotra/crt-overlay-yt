@@ -6,7 +6,7 @@
 // @namespace   https://github.com/shalap-pandotra/crt-overlay-yt
 //
 // @icon        https://shalap-pandotra.github.io/images/crt-icon.png
-// @version     1.1.0
+// @version     1.2.0
 //
 // @match       https://www.youtube.com/*
 // @grant       none
@@ -19,11 +19,11 @@
   const DEFAULT_PARAMS = {
     enabled: true,
     gamma: 2.46, saturation: 1.23, limiter: 1.0, phosphor: 0.34, whitePoint: 0.3, afterglow: 0.035,
-    scan: 0.47, scanCount: 770, bloom: 0.65, warp: 0.08,
-    vig: 0.22, bleed: 0.32, bloomThresh: 0.66, ambientGlow: 0.54,
+    scan: 0.13, scanCount: 770, bloom: 0.65, warp: 0.08,
+    vig: 0.22, bleed: 0.2, bloomThresh: 0.58, ambientGlow: 0.54,
     tintColor: '#a4a400',
     tintStrength: 0.1,
-    renderScale: 1.0,
+    renderScale: 0.4,
   };
 
   const STORAGE_KEY = 'crt-shader-settings';
@@ -78,9 +78,6 @@
     playerWrap.id = 'crt-player-wrap';
     Object.assign(playerWrap.style, {
       position: 'absolute', overflow: 'hidden', pointerEvents: 'none',
-      // Opaque backing over the real video. It must stay fully visible
-      // and fully opaque underneath: both visibility:hidden and near-zero
-      // opacity make Firefox relax frame timing and cause jitter.
       borderRadius: '0',
     });
     const canvas = document.createElement('canvas');
@@ -89,14 +86,8 @@
     playerWrap.appendChild(canvas);
     playerParent.insertBefore(playerWrap, video.nextSibling);
 
-    // The opaque backing over the real video takes YouTube's own page
-    // background color, so the margins around the warped picture blend
-    // into the page instead of reading as a black box. Fullscreen always
-    // uses black. Updates live on theme switch and fullscreen changes.
     function updateBackingColor() {
       if (document.fullscreenElement) {
-        // Transparent in fullscreen so YouTube's own background (including
-        // Ambient mode's dynamic tint) shows through around the picture.
         playerWrap.style.background = 'transparent';
         return;
       }
@@ -124,25 +115,7 @@
     let pendingW = -1, pendingH = -1, pendingSince = 0;
     let pipelineReady = false;
     let lastEffectiveValues = null;
-    // Shrink the real video so it sits entirely under the opaque part of
-    // our warped picture. This lets the margins around the picture be
-    // transparent (showing whatever YouTube paints behind the player, like
-    // Ambient mode) without the real video peeking through. The video
-    // stays fully visible and opaque, just smaller. Scale accounts for how
-    // far barrel warp pulls the picture's edges inward.
-    function applyVideoTuck() {
-      if (!params.enabled || playerWrap.style.display === 'none') return;
-      const s = Math.max(0.6, 1 - 2 * (0.02 + params.warp * 0.25));
-      const want = `scale(${s.toFixed(3)})`;
-      if (video.style.transform !== want) {
-        video.style.transformOrigin = 'center center';
-        video.style.transform = want;
-      }
-    }
-    function untuckVideo() {
-      video.style.transform = '';
-      video.style.transformOrigin = '';
-    }
+    let pipProxy = null;
 
     function syncPlayerToVideo() {
       const r = { width: video.offsetWidth, height: video.offsetHeight };
@@ -152,19 +125,12 @@
       playerWrap.style.top = video.offsetTop + 'px';
       playerWrap.style.width = r.width + 'px';
       playerWrap.style.height = r.height + 'px';
-      applyVideoTuck();
       const w = Math.round(r.width), h = Math.round(r.height);
       const sizeChanged = Math.abs(w - lastW) > 1 || Math.abs(h - lastH) > 1;
       const scaleChanged = params.renderScale !== lastRenderScale;
       if (sizeChanged && (w !== pendingW || h !== pendingH)) {
         pendingW = w; pendingH = h; pendingSince = performance.now();
       }
-      // While the player is mid-resize (YouTube animates it when switching
-      // videos or modes), keep the current backing store and let CSS stretch
-      // the canvas, instead of reallocating the canvas and every bloom buffer
-      // each frame. Reallocating clears the canvas, which is what flickered.
-      // Rebuild once the size has held still for 150ms, or immediately on
-      // the very first sizing or a render scale change.
       const settled = lastW < 0 || scaleChanged || performance.now() - pendingSince > 150;
       if ((sizeChanged || scaleChanged) && settled) {
         lastW = w; lastH = h;
@@ -366,7 +332,7 @@ gl_FragColor = vec4(col, edgeAlpha);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-      function resetVideoTexture() {
+    function resetVideoTexture() {
       historyNeedsClear = true;
       awaitingFirstFrame = true;
       navPending = false;
@@ -380,23 +346,24 @@ gl_FragColor = vec4(col, edgeAlpha);
         applyEffectVisibility();
       }
     }
+    function redrawOnce() {
+      if (!pipelineReady || !params.enabled || stopped) return;
+      try {
+        uploadVideoFrame();
+        renderRealBloom(performance.now());
+      } catch (err) {
+        console.error('[CRT] error during redraw:', err);
+      }
+    }
+    function markHistoryStale() { historyNeedsClear = true; }
     video.addEventListener('loadstart', resetVideoTexture);
     video.addEventListener('emptied', resetVideoTexture);
-    function markHistoryStale() { historyNeedsClear = true; }
     video.addEventListener('seeking', markHistoryStale);
+    video.addEventListener('seeked', redrawOnce);
+    video.addEventListener('loadeddata', redrawOnce);
 
     let videoUploadFailed = false;
-    // True while a new source is loading and hasn't produced a frame yet.
-    // The overlay stays hidden during that gap so YouTube's own plain black
-    // loading state shows, instead of an empty warped CRT box.
     let awaitingFirstFrame = video.readyState < 2;
-    // YouTube fires yt-navigate-start the moment you click a new video,
-    // before the browser starts loading it. Hiding the overlay right then
-    // covers the gap where the player is already resizing but loadstart
-    // hasn't fired yet (which caused a brief flash). navPending keeps us
-    // from reappearing on a stray frame of the OLD video before the new
-    // one loads; it clears on loadstart, or after 3s as a fallback for
-    // navigations that never load a new video (channel pages etc).
     let navPending = false;
     let navPendingTimer = 0;
     function onNavigateStart() {
@@ -420,7 +387,7 @@ gl_FragColor = vec4(col, edgeAlpha);
         }
       } catch (err) {
         videoUploadFailed = true;
-        console.error('[CRT] texImage2D on the video element failed — this usually means the browser is treating the video as tainted/cross-origin (DRM-protected content is a likely cause) and refusing to let WebGL read its pixels. Falling back to the real video. Full error:', err);
+        console.error('[CRT] texImage2D on the video element failed. This usually means the browser is treating the video as tainted/cross-origin (DRM-protected content is a likely cause) and refusing to let WebGL read its pixels. Falling back to the real video. Full error:', err);
         applyEffectVisibility();
       }
     }
@@ -511,11 +478,9 @@ vec4 sceneSample = texture2D(uScene, vUv);
 vec3 bloom = texture2D(uBloom, vUv).rgb;
 float globalLum = texture2D(uMeanLum, vec2(0.5)).r;
 float localLum = texture2D(uBloom, vUv).a;
-  float meanLum = max(globalLum, localLum);
-  float pixelLum = dot(sceneSample.rgb, vec3(0.2126, 0.7152, 0.0722));
-  // 1.0 = limit everything bright (most legible, flattest glow).
-  // 0.0 = only limit clear detail (most glow, faint text can wash out).
-  float detail = mix(0.85, 1.0, smoothstep(0.1, 0.35, localLum - pixelLum));
+float meanLum = max(globalLum, localLum);
+float pixelLum = dot(sceneSample.rgb, vec3(0.2126, 0.7152, 0.0722));
+float detail = mix(0.85, 1.0, smoothstep(0.1, 0.35, localLum - pixelLum));
 float abl = 1.0 - uLimiter * smoothstep(0.3, 0.75, meanLum) * 0.85 * detail;
 gl_FragColor = vec4(sceneSample.rgb + bloom * uBloomStrength * abl, sceneSample.a);
 }`;
@@ -885,7 +850,14 @@ background: #bebebe;
     enabledRow.appendChild(document.createTextNode(' Effect enabled'));
     panel.appendChild(enabledRow);
 
-    panel.appendChild(sliderRow('renderScale', 'Render scale (perf)', 0.4, 1, 0.05));
+    const pipButton = document.createElement('button');
+    pipButton.textContent = 'Picture-in-Picture (Ctrl+Alt+P)';
+    pipButton.style.cssText = 'display:block;width:100%;margin-top:10px;padding:5px 8px;font-family:inherit;font-size:12px;color:#1d1d1d;background:#fff;border:1.5px solid #e2e2e2;border-radius:4px;cursor:pointer;';
+    pipButton.addEventListener('click', () => {
+      if (pipProxy) stopShadedPiP(); else startShadedPiP();
+    });
+    panel.appendChild(pipButton);
+    panel.appendChild(sliderRow('renderScale', 'Softness', 0.35, 1, 0.05));
 
     panel.appendChild(sliderRow('scan', 'Scanline intensity', 0, 1, 0.01));
     panel.appendChild(sliderRow('scanCount', 'Scanline count', 100, 1200, 10));
@@ -961,34 +933,102 @@ background: #bebebe;
     });
 
     function handlePanelToggleKey(e) {
-      if (!e.ctrlKey || !e.altKey || e.metaKey || e.code !== 'KeyC') return;
+      if (!e.ctrlKey || !e.altKey || e.metaKey) return;
+      if (e.code !== 'KeyC' && e.code !== 'KeyP') return;
       const active = document.activeElement;
       const isTyping = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
       if (isTyping) return;
-      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
       e.preventDefault();
+      if (e.code === 'KeyP') {
+        if (pipProxy) stopShadedPiP(); else startShadedPiP();
+        return;
+      }
+      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
     }
     window.addEventListener('keydown', handlePanelToggleKey);
 
-    function applyEffectVisibility() {
-      const active = params.enabled && !videoUploadFailed && !awaitingFirstFrame;
-      if (active) {
-        // Deliberately NOT hiding the real video. visibility:hidden makes
-        // Firefox treat it as invisible and relax its frame timing, which
-        // made frames arrive in stalls and bursts (the random jitter). The
-        // black backing on playerWrap covers it instead.
-                video.style.visibility = '';
-        video.style.opacity = '';
-        playerWrap.style.display = '';
-        applyVideoTuck();
-      } else {
-        video.style.visibility = '';
-        video.style.opacity = '';
-        playerWrap.style.display = 'none';
-        untuckVideo();
+    function onProxyPause() { if (pipProxy && !video.paused) video.pause(); }
+    function onProxyPlay() { if (pipProxy && video.paused) video.play().catch(() => {}); }
+    function onVideoPause() { if (pipProxy && !pipProxy.paused) pipProxy.pause(); }
+    function onVideoPlay() { if (pipProxy && pipProxy.paused) pipProxy.play().catch(() => {}); }
+
+    let pipPlaceholder = null;
+    let pipCaptionHider = null;
+    function showPipPlaceholder() {
+      if (pipPlaceholder) return;
+      pipPlaceholder = document.createElement('div');
+      pipPlaceholder.textContent = 'Playing in Picture-in-Picture';
+      Object.assign(pipPlaceholder.style, {
+        position: 'absolute', inset: '0', display: 'flex',
+        alignItems: 'center', justifyContent: 'center',
+        background: '#000', color: '#8d8d8d',
+        fontFamily: 'Georgia, "Times New Roman", Times, serif',
+        fontSize: '16px', pointerEvents: 'none',
+      });
+      playerWrap.appendChild(pipPlaceholder);
+      pipCaptionHider = document.createElement('style');
+      pipCaptionHider.textContent = '.ytp-caption-window-container { display: none !important; }';
+      document.head.appendChild(pipCaptionHider);
+    }
+    function hidePipPlaceholder() {
+      if (pipPlaceholder) pipPlaceholder.remove();
+      if (pipCaptionHider) pipCaptionHider.remove();
+      pipCaptionHider = null;
+      pipPlaceholder = null;
+    }
+
+    async function startShadedPiP() {
+      if (pipProxy || !params.enabled) return;
+      try {
+        const proxy = document.createElement('video');
+        proxy.muted = true;
+        proxy.srcObject = canvas.captureStream();
+        Object.assign(proxy.style, {
+          position: 'fixed', right: '0', bottom: '0',
+          width: '1px', height: '1px', pointerEvents: 'none',
+        });
+        document.body.appendChild(proxy);
+        pipProxy = proxy;
+        await proxy.play();
+        if (video.paused) proxy.pause();
+        proxy.addEventListener('pause', onProxyPause);
+        proxy.addEventListener('play', onProxyPlay);
+        proxy.addEventListener('leavepictureinpicture', stopShadedPiP);
+        video.addEventListener('pause', onVideoPause);
+        video.addEventListener('play', onVideoPlay);
+        await proxy.requestPictureInPicture();
+        showPipPlaceholder();
+      } catch (err) {
+        console.error('[CRT] shaded PiP failed:', err);
+        stopShadedPiP();
       }
     }
+
+    function stopShadedPiP() {
+      if (!pipProxy) return;
+      const proxy = pipProxy;
+      pipProxy = null;
+      proxy.removeEventListener('pause', onProxyPause);
+      proxy.removeEventListener('play', onProxyPlay);
+      proxy.removeEventListener('leavepictureinpicture', stopShadedPiP);
+      video.removeEventListener('pause', onVideoPause);
+      video.removeEventListener('play', onVideoPlay);
+      if (document.pictureInPictureElement === proxy) {
+        document.exitPictureInPicture().catch(() => {});
+      }
+      if (proxy.srcObject) proxy.srcObject.getTracks().forEach((t) => t.stop());
+      proxy.srcObject = null;
+      proxy.remove();
+      hidePipPlaceholder();
+    }
+
+    function applyEffectVisibility() {
+      const active = params.enabled && !videoUploadFailed && !awaitingFirstFrame;
+      video.style.visibility = active ? 'hidden' : '';
+      playerWrap.style.display = active ? '' : 'none';
+    }
     applyEffectVisibility();
+
     let stopped = false;
     function teardown() {
       if (stopped) return;
@@ -997,15 +1037,16 @@ background: #bebebe;
       panel.remove();
       sliderStyleTag.remove();
       video.style.visibility = '';
-      video.style.opacity = '';
       video.removeEventListener('loadstart', resetVideoTexture);
       video.removeEventListener('emptied', resetVideoTexture);
       video.removeEventListener('seeking', markHistoryStale);
+      video.removeEventListener('seeked', redrawOnce);
+      video.removeEventListener('loadeddata', redrawOnce);
       window.removeEventListener('keydown', handlePanelToggleKey);
       videoResizeObserver.disconnect();
       themeObserver.disconnect();
-      untuckVideo();
       document.removeEventListener('yt-navigate-start', onNavigateStart);
+      stopShadedPiP();
       clearTimeout(navPendingTimer);
       document.removeEventListener('fullscreenchange', updateBackingColor);
       const loseContextExt = gl.getExtension('WEBGL_lose_context');
@@ -1015,84 +1056,19 @@ background: #bebebe;
     }
     pipelineReady = true;
 
-        // ---- Jitter diagnostics (temporary, flip to false or remove later) ----
-    const JANK_DEBUG = true;
-    const jank = { lastNow: 0, lastPresented: -1, lastMedia: -1, frames: 0, skipped: 0, late: 0,
-      slowUpload: 0, slowRender: 0, slowSync: 0, maxUpload: 0, maxRender: 0, maxSync: 0, since: performance.now() };
-    function jankSync(ms) {
-      jank.maxSync = Math.max(jank.maxSync, ms);
-      if (ms > 3) jank.slowSync++;
-    }
-    function jankFrame(now, md, uploadMs, renderMs) {
-      jank.frames++;
-      jank.maxUpload = Math.max(jank.maxUpload, uploadMs);
-      jank.maxRender = Math.max(jank.maxRender, renderMs);
-      if (uploadMs > 6) jank.slowUpload++;
-      if (renderMs > 6) jank.slowRender++;
-      if (md && jank.lastPresented >= 0) {
-        const skipped = md.presentedFrames - jank.lastPresented - 1;
-        const gap = now - jank.lastNow;
-        const frameDur = (md.mediaTime - jank.lastMedia) * 1000;
-        const sane = frameDur > 0 && frameDur < 200 && gap < 1000; // ignore seeks/pauses
-        if (sane && skipped >= 2) {
-        jank.skipped += skipped;
-          console.warn(`[CRT jank] @${video.currentTime.toFixed(1)}s missed ${skipped} frame(s). gap=${gap.toFixed(1)}ms, video frame=${frameDur.toFixed(1)}ms, upload=${uploadMs.toFixed(1)}ms, render=${renderMs.toFixed(1)}ms`);
-        } else if (sane && gap >= 100) {
-          jank.late++;
-          console.warn(`[CRT jank] @${video.currentTime.toFixed(1)}s late callback. gap=${gap.toFixed(1)}ms, video frame=${frameDur.toFixed(1)}ms, upload=${uploadMs.toFixed(1)}ms, render=${renderMs.toFixed(1)}ms`);
-        }
-      }
-      if (md) { jank.lastPresented = md.presentedFrames; jank.lastMedia = md.mediaTime; }
-      jank.lastNow = now;
-      if (performance.now() - jank.since > 10000) {
-        console.log(`[CRT jank] 10s summary: frames=${jank.frames} missed=${jank.skipped} late=${jank.late} | upload max=${jank.maxUpload.toFixed(1)}ms slow=${jank.slowUpload} | render max=${jank.maxRender.toFixed(1)}ms slow=${jank.slowRender} | sync max=${jank.maxSync.toFixed(1)}ms slow=${jank.slowSync} | video=${video.videoWidth}x${video.videoHeight} canvas=${canvas.width}x${canvas.height}`);
-        Object.assign(jank, { frames: 0, skipped: 0, late: 0, slowUpload: 0, slowRender: 0, slowSync: 0, maxUpload: 0, maxRender: 0, maxSync: 0, since: performance.now() });
-      }
-    }
-
-    const hasRVFC = false; // TEST: force render-every-refresh path
-    function onNewVideoFrame(now, metadata) {
-      if (stopped) return; // don't keep re-registering after teardown
-      if (params.enabled && !document.hidden) {
-        try {
-          const t0 = performance.now();
-          uploadVideoFrame();
-          const t1 = performance.now();
-          renderRealBloom(performance.now());
-          const t2 = performance.now();
-          if (JANK_DEBUG) jankFrame(now, metadata, t1 - t0, t2 - t1);
-        } catch (err) {
-          console.error('[CRT] error during video-frame render, continuing anyway:', err);
-        }
-      }
-      video.requestVideoFrameCallback(onNewVideoFrame);
-    }
-    if (hasRVFC) {
-      video.requestVideoFrameCallback(onNewVideoFrame);
-    } else {
-      console.log('[CRT] requestVideoFrameCallback not available on this browser — falling back to rendering every animation frame regardless of whether the video frame actually changed.');
-    }
-
     function render(t) {
       if (stopped) return;
       if (!document.contains(video)) {
         teardown();
         return;
       }
-      if (!params.enabled) {
-        requestAnimationFrame(render);
-        return;
-      }
-      if (!document.hidden) {
+      if (params.enabled && (!document.hidden || pipProxy)) {
         try {
-            const s0 = performance.now();
+          const playing = !video.paused && !video.ended;
+          if (playing) uploadVideoFrame();
           syncPlayerToVideo();
-          if (JANK_DEBUG) jankSync(performance.now() - s0);
           updateEffectiveDisplays();
-          if (!hasRVFC) {
-            uploadVideoFrame();
-            renderRealBloom(t);
-          }
+          if (playing) renderRealBloom(t);
         } catch (err) {
           console.error('[CRT] error during render, continuing anyway:', err);
         }
